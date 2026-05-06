@@ -1,0 +1,5 @@
+/target/
+agent-hub.db
+*.db
+*.sqlite
+.env
