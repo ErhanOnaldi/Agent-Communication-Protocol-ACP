@@ -1,16 +1,21 @@
 use std::time::Duration;
 
+use agent_client::AgentClient;
 use agent_protocol::{
-    HeartbeatRequest, MessageCreateRequest, MessageKind, MessageRecord, MessageStatus, ReplyRequest,
+    AgentStatus, BroadcastRequest, Confidence, FileClaimRequest, FindingCreateRequest, FindingKind,
+    HeartbeatRequest, MessageCreateRequest, MessageKind, MessageRecord, MessageStatus,
+    ReplyRequest, RoleMessageRequest, TaskClaimRequest, TaskCreateRequest, TaskPriority,
+    TaskStatus, TaskStatusRequest, UpdateAgentStatusRequest,
 };
-use anyhow::{bail, Context};
-use clap::{Parser, Subcommand};
-use futures_util::StreamExt;
-use reqwest::Client;
+use anyhow::Context;
+use clap::{Args, Parser, Subcommand};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
-#[command(name = "agentctl", about = "CLI client for LAN Agent Messenger")]
+#[command(
+    name = "agentctl",
+    about = "CLI client for Agent Communication Protocol"
+)]
 struct Cli {
     #[arg(long, env = "AGENT_HUB_URL", default_value = "http://127.0.0.1:8787")]
     hub_url: String,
@@ -26,26 +31,20 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum Command {
-    Register {
-        #[arg(long)]
-        hostname: Option<String>,
+    Register(RegisterArgs),
+    Heartbeat,
+    Agents {
+        #[command(subcommand)]
+        command: AgentsCommand,
     },
-    Send {
-        #[arg(long)]
-        to: String,
-        #[arg(long, default_value = "notice")]
-        kind: MessageKind,
-        #[arg(long)]
-        subject: String,
-        #[arg(long)]
-        body: String,
-        #[arg(long)]
-        thread_id: Option<Uuid>,
-        #[arg(long)]
-        reply_to: Option<Uuid>,
+    Status {
+        #[command(subcommand)]
+        command: StatusCommand,
     },
+    Send(SendArgs),
+    Broadcast(BroadcastArgs),
     Ask {
         #[arg(long)]
         to: String,
@@ -54,14 +53,7 @@ enum Command {
         #[arg(long)]
         body: String,
     },
-    Reply {
-        #[arg(long = "message-id")]
-        message_id: Uuid,
-        #[arg(long)]
-        body: String,
-        #[arg(long)]
-        subject: Option<String>,
-    },
+    Reply(ReplyArgs),
     Inbox {
         #[arg(long)]
         unread: bool,
@@ -72,6 +64,26 @@ enum Command {
         #[arg(long = "message-id")]
         message_id: Uuid,
     },
+    Threads {
+        #[command(subcommand)]
+        command: ThreadsCommand,
+    },
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
+    File {
+        #[command(subcommand)]
+        command: FileCommand,
+    },
+    Finding {
+        #[command(subcommand)]
+        command: FindingCommand,
+    },
+    Findings {
+        #[command(subcommand)]
+        command: FindingsCommand,
+    },
     Watch,
     Wait {
         #[arg(long)]
@@ -81,281 +93,465 @@ enum Command {
     },
 }
 
+#[derive(Debug, Clone, Args)]
+struct RegisterArgs {
+    #[arg(long)]
+    hostname: Option<String>,
+    #[arg(long)]
+    status: Option<AgentStatus>,
+    #[arg(long)]
+    task: Option<String>,
+    #[arg(long)]
+    branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct SendArgs {
+    #[arg(long)]
+    to: Option<String>,
+    #[arg(long = "to-role")]
+    to_role: Option<String>,
+    #[arg(long, default_value = "notice")]
+    kind: MessageKind,
+    #[arg(long)]
+    subject: String,
+    #[arg(long)]
+    body: String,
+    #[arg(long)]
+    thread_id: Option<Uuid>,
+    #[arg(long)]
+    reply_to: Option<Uuid>,
+    #[arg(long)]
+    exclude_self: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct BroadcastArgs {
+    #[arg(long, default_value = "status_update")]
+    kind: MessageKind,
+    #[arg(long)]
+    subject: String,
+    #[arg(long)]
+    body: String,
+    #[arg(long)]
+    exclude_self: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ReplyArgs {
+    #[arg(long = "message-id")]
+    message_id: Option<Uuid>,
+    #[arg(long = "thread-id")]
+    thread_id: Option<Uuid>,
+    #[arg(long)]
+    body: String,
+    #[arg(long)]
+    subject: Option<String>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum AgentsCommand {
+    List,
+    Show { agent_id: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum StatusCommand {
+    Set {
+        #[arg(long)]
+        status: AgentStatus,
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    Clear,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ThreadsCommand {
+    List,
+    Show { thread_id: Uuid },
+    Close { thread_id: Uuid },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum TaskCommand {
+    Create {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        body: String,
+        #[arg(long)]
+        priority: Option<TaskPriority>,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    List,
+    Show {
+        task_id: Uuid,
+    },
+    Claim {
+        task_id: Uuid,
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    Update {
+        task_id: Uuid,
+        #[arg(long)]
+        status: TaskStatus,
+        #[arg(long)]
+        body: Option<String>,
+    },
+    Done {
+        task_id: Uuid,
+        #[arg(long)]
+        body: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum FileCommand {
+    Claim {
+        path: String,
+        #[arg(long)]
+        task: Option<Uuid>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long = "ttl-seconds")]
+        ttl_seconds: Option<i64>,
+    },
+    Release {
+        claim_id: Uuid,
+    },
+    Claims {
+        #[arg(long)]
+        path: Option<String>,
+    },
+    Check {
+        path: String,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum FindingCommand {
+    Publish {
+        #[arg(long)]
+        kind: FindingKind,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        body: String,
+        #[arg(long = "file")]
+        files: Vec<String>,
+        #[arg(long, default_value = "medium")]
+        confidence: Confidence,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum FindingsCommand {
+    List,
+    Show { finding_id: Uuid },
+    Search { query: String },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let client = ApiClient::new(cli.hub_url, cli.token)?;
+    let client = AgentClient::new(cli.hub_url.clone(), cli.token.clone())?;
 
-    match cli.command {
-        Command::Register { hostname } => {
-            let agent_id = required(cli.agent_id, "AGENT_ID or --agent-id")?;
-            let role = required(cli.agent_role, "AGENT_ROLE or --agent-role")?;
-            let record = client.register(&agent_id, &role, hostname).await?;
-            print_value(
-                cli.json,
-                &record,
-                &format!("registered {} ({})", record.id, record.role),
-            )?;
+    match cli.command.clone() {
+        Command::Register(args) => {
+            let req = heartbeat_request(&cli, args.status, args.task, args.branch, args.hostname)?;
+            print_value(cli.json, &client.register(&req).await?)?;
         }
-        Command::Send {
-            to,
-            kind,
-            subject,
-            body,
-            thread_id,
-            reply_to,
-        } => {
-            let from = required(cli.agent_id, "AGENT_ID or --agent-id")?;
-            let message = client
-                .send(MessageCreateRequest {
+        Command::Heartbeat => {
+            let req = heartbeat_request(&cli, Some(AgentStatus::Online), None, None, None)?;
+            print_value(cli.json, &client.register(&req).await?)?;
+        }
+        Command::Agents { command } => match command {
+            AgentsCommand::List => print_value(cli.json, &client.agents().await?)?,
+            AgentsCommand::Show { agent_id } => {
+                print_value(cli.json, &client.agent(&agent_id).await?)?
+            }
+        },
+        Command::Status { command } => {
+            let agent_id = required(cli.agent_id.as_ref(), "AGENT_ID or --agent-id")?;
+            let req = match command {
+                StatusCommand::Set {
+                    status,
+                    task,
+                    branch,
+                } => UpdateAgentStatusRequest {
+                    status,
+                    current_task: task,
+                    branch,
+                },
+                StatusCommand::Clear => UpdateAgentStatusRequest {
+                    status: AgentStatus::Idle,
+                    current_task: None,
+                    branch: None,
+                },
+            };
+            print_value(cli.json, &client.update_status(agent_id, &req).await?)?;
+        }
+        Command::Send(args) => {
+            let from = required(cli.agent_id.as_ref(), "AGENT_ID or --agent-id")?.to_string();
+            if let Some(role) = args.to_role {
+                let req = RoleMessageRequest {
+                    from,
+                    role,
+                    kind: args.kind,
+                    subject: args.subject,
+                    body: args.body,
+                    exclude_self: args.exclude_self,
+                };
+                print_value(cli.json, &client.send_to_role(&req).await?)?;
+            } else {
+                let to = args.to.context("use --to <agent-id> or --to-role <role>")?;
+                let req = MessageCreateRequest {
                     from,
                     to,
-                    kind,
-                    subject,
-                    body,
-                    thread_id,
-                    reply_to,
-                })
-                .await?;
-            print_message(cli.json, &message)?;
+                    kind: args.kind,
+                    subject: args.subject,
+                    body: args.body,
+                    thread_id: args.thread_id,
+                    reply_to: args.reply_to,
+                };
+                print_message(cli.json, &client.send(&req).await?)?;
+            }
+        }
+        Command::Broadcast(args) => {
+            let req = BroadcastRequest {
+                from: required(cli.agent_id.as_ref(), "AGENT_ID or --agent-id")?.to_string(),
+                kind: args.kind,
+                subject: args.subject,
+                body: args.body,
+                exclude_self: args.exclude_self,
+            };
+            print_value(cli.json, &client.broadcast(&req).await?)?;
         }
         Command::Ask { to, subject, body } => {
-            let from = required(cli.agent_id, "AGENT_ID or --agent-id")?;
-            let message = client
-                .send(MessageCreateRequest {
-                    from,
-                    to,
-                    kind: MessageKind::Question,
-                    subject,
-                    body,
-                    thread_id: None,
-                    reply_to: None,
-                })
-                .await?;
-            print_message(cli.json, &message)?;
+            let req = MessageCreateRequest {
+                from: required(cli.agent_id.as_ref(), "AGENT_ID or --agent-id")?.to_string(),
+                to,
+                kind: MessageKind::Question,
+                subject,
+                body,
+                thread_id: None,
+                reply_to: None,
+            };
+            print_message(cli.json, &client.send(&req).await?)?;
         }
-        Command::Reply {
-            message_id,
-            body,
-            subject,
-        } => {
-            let from = required(cli.agent_id, "AGENT_ID or --agent-id")?;
-            let message = client
-                .reply(
-                    message_id,
-                    ReplyRequest {
-                        from,
-                        body,
-                        subject,
-                    },
-                )
-                .await?;
+        Command::Reply(args) => {
+            let req = ReplyRequest {
+                from: required(cli.agent_id.as_ref(), "AGENT_ID or --agent-id")?.to_string(),
+                body: args.body,
+                subject: args.subject,
+                thread_id: args.thread_id,
+            };
+            let message = match (args.message_id, args.thread_id) {
+                (Some(id), _) => client.reply(id, &req).await?,
+                (None, Some(thread_id)) => client.reply_to_thread(thread_id, &req).await?,
+                (None, None) => anyhow::bail!("use --message-id <id> or --thread-id <id>"),
+            };
             print_message(cli.json, &message)?;
         }
         Command::Inbox { unread, kind } => {
-            let agent_id = required(cli.agent_id, "AGENT_ID or --agent-id")?;
+            let agent_id = required(cli.agent_id.as_ref(), "AGENT_ID or --agent-id")?;
             let status = unread.then_some(MessageStatus::Unread);
-            let messages = client.inbox(&agent_id, status, kind).await?;
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&messages)?);
-            } else if messages.is_empty() {
-                println!("inbox empty");
-            } else {
-                for message in messages {
-                    print_message(false, &message)?;
-                }
-            }
+            print_value(cli.json, &client.inbox(agent_id, status, kind).await?)?;
         }
         Command::MarkRead { message_id } => {
-            let message = client.mark_read(message_id).await?;
-            print_message(cli.json, &message)?;
+            print_message(cli.json, &client.mark_read(message_id).await?)?;
         }
+        Command::Threads { command } => match command {
+            ThreadsCommand::List => {
+                let agent_id = cli.agent_id.as_deref();
+                print_value(cli.json, &client.threads(agent_id).await?)?;
+            }
+            ThreadsCommand::Show { thread_id } => {
+                print_value(cli.json, &client.thread(thread_id).await?)?
+            }
+            ThreadsCommand::Close { thread_id } => {
+                print_value(cli.json, &client.close_thread(thread_id).await?)?;
+            }
+        },
+        Command::Task { command } => handle_task(&cli, &client, command).await?,
+        Command::File { command } => handle_file(&cli, &client, command).await?,
+        Command::Finding { command } => handle_finding(&cli, &client, command).await?,
+        Command::Findings { command } => match command {
+            FindingsCommand::List => print_value(cli.json, &client.findings(None).await?)?,
+            FindingsCommand::Show { finding_id } => {
+                print_value(cli.json, &client.finding(finding_id).await?)?;
+            }
+            FindingsCommand::Search { query } => {
+                print_value(cli.json, &client.findings(Some(&query)).await?)?;
+            }
+        },
         Command::Watch => {
-            let agent_id = required(cli.agent_id, "AGENT_ID or --agent-id")?;
-            client.watch(&agent_id, cli.json, None).await?;
+            let agent_id = required(cli.agent_id.as_ref(), "AGENT_ID or --agent-id")?;
+            client
+                .watch(agent_id, None, |message| {
+                    print_message(cli.json, &message)?;
+                    Ok(true)
+                })
+                .await?;
         }
         Command::Wait { kind, timeout } => {
-            let agent_id = required(cli.agent_id, "AGENT_ID or --agent-id")?;
+            let agent_id = required(cli.agent_id.as_ref(), "AGENT_ID or --agent-id")?;
             let timeout = parse_duration(&timeout)?;
             client
-                .watch(&agent_id, cli.json, Some((kind, timeout)))
+                .watch(agent_id, Some((kind, timeout)), |message| {
+                    print_message(cli.json, &message)?;
+                    Ok(false)
+                })
                 .await?;
         }
     }
     Ok(())
 }
 
-struct ApiClient {
-    base_url: String,
-    token: String,
-    client: Client,
-}
-
-impl ApiClient {
-    fn new(base_url: String, token: String) -> anyhow::Result<Self> {
-        if token.trim().is_empty() {
-            bail!("AGENT_TOKEN cannot be empty");
-        }
-        Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            token,
-            client: Client::new(),
-        })
-    }
-
-    async fn register(
-        &self,
-        agent_id: &str,
-        role: &str,
-        hostname: Option<String>,
-    ) -> anyhow::Result<agent_protocol::AgentRecord> {
-        self.post(
-            "/api/agents/heartbeat",
-            &HeartbeatRequest {
-                agent_id: agent_id.to_string(),
-                role: role.to_string(),
-                hostname,
-            },
-        )
-        .await
-    }
-
-    async fn send(&self, request: MessageCreateRequest) -> anyhow::Result<MessageRecord> {
-        self.post("/api/messages", &request).await
-    }
-
-    async fn reply(&self, id: Uuid, request: ReplyRequest) -> anyhow::Result<MessageRecord> {
-        self.post(&format!("/api/messages/{id}/reply"), &request)
-            .await
-    }
-
-    async fn mark_read(&self, id: Uuid) -> anyhow::Result<MessageRecord> {
-        self.post(&format!("/api/messages/{id}/read"), &serde_json::json!({}))
-            .await
-    }
-
-    async fn inbox(
-        &self,
-        agent_id: &str,
-        status: Option<MessageStatus>,
-        kind: Option<MessageKind>,
-    ) -> anyhow::Result<Vec<MessageRecord>> {
-        let mut url = format!("{}/api/messages?agent_id={}", self.base_url, agent_id);
-        if let Some(status) = status {
-            url.push_str("&status=");
-            url.push_str(&status.to_string());
-        }
-        if let Some(kind) = kind {
-            url.push_str("&kind=");
-            url.push_str(&kind.to_string());
-        }
-        let response = self.client.get(url).bearer_auth(&self.token).send().await?;
-        decode_response(response).await
-    }
-
-    async fn watch(
-        &self,
-        agent_id: &str,
-        json: bool,
-        wait: Option<(Option<MessageKind>, Duration)>,
-    ) -> anyhow::Result<()> {
-        let url = format!("{}/api/stream?agent_id={}", self.base_url, agent_id);
-        let response = self.client.get(url).bearer_auth(&self.token).send().await?;
-        if !response.status().is_success() {
-            bail!("request failed: {}", response.text().await?);
-        }
-        let deadline = wait.map(|(_, duration)| tokio::time::Instant::now() + duration);
-        let expected_kind = wait.and_then(|(kind, _)| kind);
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-
-        loop {
-            if let Some(deadline) = deadline {
-                tokio::select! {
-                    chunk = stream.next() => {
-                        if !handle_stream_chunk(chunk, &mut buffer, expected_kind, json)? {
-                            return Ok(());
-                        }
-                    }
-                    _ = tokio::time::sleep_until(deadline) => bail!("timed out waiting for message"),
-                }
-            } else if !handle_stream_chunk(stream.next().await, &mut buffer, expected_kind, json)? {
-                return Ok(());
-            }
-        }
-    }
-
-    async fn post<T, R>(&self, path: &str, body: &T) -> anyhow::Result<R>
-    where
-        T: serde::Serialize + ?Sized,
-        R: serde::de::DeserializeOwned,
-    {
-        let response = self
-            .client
-            .post(format!("{}{}", self.base_url, path))
-            .bearer_auth(&self.token)
-            .json(body)
-            .send()
-            .await?;
-        decode_response(response).await
-    }
-}
-
-async fn decode_response<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
-) -> anyhow::Result<T> {
-    let status = response.status();
-    let text = response.text().await?;
-    if !status.is_success() {
-        bail!("request failed ({status}): {text}");
-    }
-    Ok(serde_json::from_str(&text).with_context(|| format!("invalid response: {text}"))?)
-}
-
-fn handle_stream_chunk(
-    chunk: Option<Result<bytes::Bytes, reqwest::Error>>,
-    buffer: &mut String,
-    expected_kind: Option<MessageKind>,
-    json: bool,
-) -> anyhow::Result<bool> {
-    let Some(chunk) = chunk else {
-        return Ok(false);
-    };
-    let chunk = chunk?;
-    buffer.push_str(std::str::from_utf8(&chunk)?);
-    while let Some(pos) = buffer.find("\n\n") {
-        let frame = buffer[..pos].to_string();
-        buffer.drain(..pos + 2);
-        for line in frame.lines() {
-            let Some(data) = line.strip_prefix("data:") else {
-                continue;
+async fn handle_task(cli: &Cli, client: &AgentClient, command: TaskCommand) -> anyhow::Result<()> {
+    match command {
+        TaskCommand::Create {
+            title,
+            body,
+            priority,
+            owner,
+            branch,
+        } => {
+            let req = TaskCreateRequest {
+                title,
+                body,
+                priority,
+                owner,
+                branch,
+                created_by: required(cli.agent_id.as_ref(), "AGENT_ID or --agent-id")?.to_string(),
             };
-            let data = data.trim();
-            if data.is_empty() || data == "keep-alive" || data == "{}" {
-                continue;
-            }
-            let message: MessageRecord = serde_json::from_str(data)?;
-            if expected_kind.is_some_and(|kind| kind != message.kind) {
-                continue;
-            }
-            print_message(json, &message)?;
-            return Ok(expected_kind.is_none());
+            print_value(cli.json, &client.create_task(&req).await?)?;
+        }
+        TaskCommand::List => print_value(cli.json, &client.tasks().await?)?,
+        TaskCommand::Show { task_id } => print_value(cli.json, &client.task(task_id).await?)?,
+        TaskCommand::Claim { task_id, branch } => {
+            let req = TaskClaimRequest {
+                agent_id: required(cli.agent_id.as_ref(), "AGENT_ID or --agent-id")?.to_string(),
+                branch,
+            };
+            print_value(cli.json, &client.claim_task(task_id, &req).await?)?;
+        }
+        TaskCommand::Update {
+            task_id,
+            status,
+            body,
+        } => {
+            let req = TaskStatusRequest { status, body };
+            print_value(cli.json, &client.update_task(task_id, &req).await?)?;
+        }
+        TaskCommand::Done { task_id, body } => {
+            let req = TaskStatusRequest {
+                status: TaskStatus::Done,
+                body,
+            };
+            print_value(cli.json, &client.done_task(task_id, &req).await?)?;
         }
     }
-    Ok(true)
+    Ok(())
 }
 
-fn required(value: Option<String>, name: &str) -> anyhow::Result<String> {
+async fn handle_file(cli: &Cli, client: &AgentClient, command: FileCommand) -> anyhow::Result<()> {
+    match command {
+        FileCommand::Claim {
+            path,
+            task,
+            branch,
+            reason,
+            ttl_seconds,
+        } => {
+            let req = FileClaimRequest {
+                file_path: path,
+                claimed_by: required(cli.agent_id.as_ref(), "AGENT_ID or --agent-id")?.to_string(),
+                task_id: task,
+                branch,
+                reason,
+                ttl_seconds,
+            };
+            print_value(cli.json, &client.claim_file(&req).await?)?;
+        }
+        FileCommand::Release { claim_id } => {
+            print_value(cli.json, &client.release_file_claim(claim_id).await?)?;
+        }
+        FileCommand::Claims { path } => {
+            print_value(cli.json, &client.file_claims(path.as_deref()).await?)?
+        }
+        FileCommand::Check { path } => {
+            print_value(cli.json, &client.file_claims(Some(&path)).await?)?
+        }
+    }
+    Ok(())
+}
+
+async fn handle_finding(
+    cli: &Cli,
+    client: &AgentClient,
+    command: FindingCommand,
+) -> anyhow::Result<()> {
+    match command {
+        FindingCommand::Publish {
+            kind,
+            title,
+            body,
+            files,
+            confidence,
+        } => {
+            let req = FindingCreateRequest {
+                agent_id: required(cli.agent_id.as_ref(), "AGENT_ID or --agent-id")?.to_string(),
+                kind,
+                title,
+                body,
+                files,
+                confidence,
+            };
+            print_value(cli.json, &client.create_finding(&req).await?)?;
+        }
+    }
+    Ok(())
+}
+
+fn heartbeat_request(
+    cli: &Cli,
+    status: Option<AgentStatus>,
+    current_task: Option<String>,
+    branch: Option<String>,
+    hostname: Option<String>,
+) -> anyhow::Result<HeartbeatRequest> {
+    Ok(HeartbeatRequest {
+        agent_id: required(cli.agent_id.as_ref(), "AGENT_ID or --agent-id")?.to_string(),
+        role: required(cli.agent_role.as_ref(), "AGENT_ROLE or --agent-role")?.to_string(),
+        hostname,
+        status,
+        current_task,
+        branch,
+    })
+}
+
+fn required<'a>(value: Option<&'a String>, name: &str) -> anyhow::Result<&'a str> {
     value
+        .map(String::as_str)
         .filter(|value| !value.trim().is_empty())
         .with_context(|| format!("{name} must be set"))
 }
 
-fn print_value<T: serde::Serialize>(json: bool, value: &T, human: &str) -> anyhow::Result<()> {
+fn print_value<T: serde::Serialize>(json: bool, value: &T) -> anyhow::Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(value)?);
     } else {
-        println!("{human}");
+        println!("{}", serde_json::to_string_pretty(value)?);
     }
     Ok(())
 }

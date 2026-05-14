@@ -1,85 +1,62 @@
-# LAN Agent Messenger
+# Agent Communication Protocol
 
-Small LAN-only coordination tool for AI agents working on separate machines. One machine runs `agent-hub`; each agent uses `agentctl` to register, send notices, ask questions, reply, read inbox messages, and watch live messages.
+Local-first coordination hub for AI coding agents.
 
-## Build
+ACP lets multiple AI coding agents such as Codex, Claude Code, GitHub Copilot and other terminal-driven agents coordinate on the same repository through messages, presence, threads, tasks, soft file ownership and shared findings.
 
-```bash
-cargo build
-```
+## What Is Included
 
-## Run The Hub
+- `agent-hub`: Axum HTTP/SSE server with SQLite persistence.
+- `agentctl`: CLI used by agents and humans.
+- `agent-client`: reusable HTTP client crate for future MCP tools.
+- `agent-protocol`: shared JSON models and workflow enums.
+
+## Quickstart
+
+See [docs/QUICKSTART.md](docs/QUICKSTART.md).
+
+Short version:
 
 ```bash
 export AGENT_TOKEN=change-me-local-shared-token
-export AGENT_HUB_DATABASE_URL=sqlite://agent-hub.db
 cargo run -p agent-hub
 ```
 
-The hub listens on `0.0.0.0:8787` by default. Other machines on the same LAN should use `http://<hub-lan-ip>:8787`.
-
-## Use The CLI
+In each agent shell:
 
 ```bash
-export AGENT_HUB_URL=http://127.0.0.1:8787
+export AGENT_HUB_URL=http://<hub-lan-ip>:8787
 export AGENT_TOKEN=change-me-local-shared-token
-export AGENT_ID=frontend-macbook
-export AGENT_ROLE=frontend
+export AGENT_ID=frontend-ui-agent
+export AGENT_ROLE=frontend_engineer
 
 cargo run -p agentctl -- register
-```
-
-Send a contract change:
-
-```bash
-cargo run -p agentctl -- send --to backend-windows --kind contract_change \
-  --subject "abc/{id} endpoint response changed" \
-  --body "name alanı display_name olarak değişti."
-```
-
-Ask a question:
-
-```bash
-cargo run -p agentctl -- ask --to backend-windows \
-  --subject "Health sync payload" \
-  --body "daily_nutrition_summaries alanını ne zaman export'a ekleyeceksin?"
-```
-
-Read unread messages:
-
-```bash
 cargo run -p agentctl -- inbox --unread
 ```
 
-Watch live messages:
+## Common Commands
 
 ```bash
-cargo run -p agentctl -- watch
+cargo run -p agentctl -- agents list
+cargo run -p agentctl -- status set --status working --task "Fix chart layout"
+cargo run -p agentctl -- broadcast --exclude-self --subject "Sync" --body "Read the latest findings before coding."
+cargo run -p agentctl -- send --to-role backend_engineer --kind contract_change --subject "DTO changed" --body "UserResponse.name is now display_name."
+cargo run -p agentctl -- threads list
+cargo run -p agentctl -- task create --title "Fix auth panic" --body "Missing token panics."
+cargo run -p agentctl -- file claim src/auth/middleware.rs --reason "Fix auth panic"
+cargo run -p agentctl -- finding publish --kind root_cause --title "Missing auth header panic" --body "Parser unwraps missing Authorization." --file src/auth/middleware.rs --confidence high
 ```
 
-Wait for a question for up to 30 minutes:
+## Docs
 
-```bash
-cargo run -p agentctl -- wait --kind question --timeout 30m
-```
-
-Reply:
-
-```bash
-cargo run -p agentctl -- reply --message-id <uuid> \
-  --body "Backend tarafında payload ve export alanlarını ekledim."
-```
-
-## HTTP API
-
-All API routes except `/health` require `Authorization: Bearer <AGENT_TOKEN>`.
-
-- `POST /api/agents/heartbeat`
-- `POST /api/messages`
-- `GET /api/messages?agent_id=<id>&status=unread`
-- `POST /api/messages/{id}/read`
-- `POST /api/messages/{id}/reply`
-- `GET /api/stream?agent_id=<id>`
+- [Quickstart](docs/QUICKSTART.md)
+- [Four-agent workflow](docs/FOUR_AGENT_WORKFLOW.md)
+- [Message kinds](docs/MESSAGE_KINDS.md)
+- [Tasks](docs/TASKS.md)
+- [File claims](docs/FILE_CLAIMS.md)
+- [Findings](docs/FINDINGS.md)
+- [HTTP API](docs/HTTP_API.md)
+- [MCP roadmap](docs/MCP_ROADMAP.md)
 
 ## Test
 
