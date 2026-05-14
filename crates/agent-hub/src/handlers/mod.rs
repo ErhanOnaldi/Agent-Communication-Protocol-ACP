@@ -1,4 +1,5 @@
 pub(crate) mod agents;
+pub(crate) mod analytics;
 pub(crate) mod files;
 pub(crate) mod findings;
 pub(crate) mod messages;

@@ -1,7 +1,8 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use acp_protocol::{
-    CapabilityScoreRecord, ModelRecord, SkillDefinition, SlotStatus, WorkflowConfig, WorkflowStep,
+    CapabilityScoreRecord, ModelRecord, RuntimeHealth, SkillDefinition, SlotStatus, WorkflowConfig,
+    WorkflowStep,
 };
 use acp_workspace::WorkspaceEngine;
 use anyhow::{bail, Context};
@@ -13,9 +14,11 @@ use tokio::{
 use tracing::instrument;
 
 use crate::{
+    adaptive::AdaptiveController,
     memory::HandoffContext,
     recovery::{action_role, failure_action_for_role, find_skill, run_action_with_recovery, ActionCtx},
     scheduler::Scheduler,
+    semantic::MemoryIndex,
     slots::{emit_slot, emit_step, SlotLifecycleEvent},
     OrchestratorEvent, PipelineRunReport,
 };
@@ -89,6 +92,12 @@ pub async fn run_local_pipeline_with_events(
     let slot_events = Arc::new(Mutex::new(slot_events));
     let mut step_results = Vec::new();
 
+    // Phase 3: semantic memory index and adaptive profile controller.
+    let mut memory = MemoryIndex::new();
+    let mut controller = AdaptiveController::new(config.workflow.profile);
+    // Track last step health for conditional step evaluation.
+    let mut last_health: Option<RuntimeHealth> = None;
+
     for step in &config.workflow.steps {
         match step {
             WorkflowStep::Action(action) => {
@@ -96,6 +105,10 @@ pub async fn run_local_pipeline_with_events(
                 let role = action_role(action);
                 let fa = failure_action_for_role(failure_policy, &role);
                 let skill = find_skill(&skills, &role, &config.workflow.slots);
+
+                // Inject semantic context from prior steps.
+                inject_semantic_context(&memory, action, &handoff_contexts).await;
+
                 let result = timeout(
                     effective_step_timeout(step_timeout, pipeline_deadline),
                     run_action_with_recovery(
@@ -113,10 +126,26 @@ pub async fn run_local_pipeline_with_events(
                 )
                 .await
                 .with_context(|| format!("workflow step timed out: {action}"))??;
+
+                // Update semantic index with step output.
+                let snippet = result.stdout.chars().take(500).collect::<String>();
+                memory.add(&result.step, &snippet);
+
+                last_health = Some(result.health);
+                let updated_profile = controller.record_step(result.health);
+                if updated_profile != config.workflow.profile {
+                    tracing::info!(profile = %updated_profile, "adaptive: profile updated mid-pipeline");
+                }
+
                 emit_step(&event_sink, result.clone());
                 step_results.push(result);
             }
             WorkflowStep::Parallel { parallel } => {
+                // Pre-compute semantic context for each role before spawning.
+                for action in parallel.iter() {
+                    inject_semantic_context(&memory, action, &handoff_contexts).await;
+                }
+
                 let mut join_set = JoinSet::new();
                 for action in parallel {
                     enforce_pipeline_deadline(pipeline_deadline)?;
@@ -152,9 +181,62 @@ pub async fn run_local_pipeline_with_events(
                 }
                 while let Some(res) = join_set.join_next().await {
                     let result = res.context("parallel workflow task panicked")??;
+                    let snippet = result.stdout.chars().take(500).collect::<String>();
+                    memory.add(&result.step, &snippet);
+                    last_health = Some(result.health);
+                    controller.record_step(result.health);
                     emit_step(&event_sink, result.clone());
                     step_results.push(result);
                 }
+            }
+            WorkflowStep::Conditional { action, when_healthy } => {
+                // Only run if the previous step health matches the condition.
+                if *when_healthy {
+                    match last_health {
+                        Some(h) if h != RuntimeHealth::Healthy => {
+                            tracing::info!(
+                                action = %action,
+                                prev_health = %h,
+                                "skipping conditional step: previous step was not healthy"
+                            );
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                enforce_pipeline_deadline(pipeline_deadline)?;
+                let role = action_role(action);
+                let fa = failure_action_for_role(failure_policy, &role);
+                let skill = find_skill(&skills, &role, &config.workflow.slots);
+
+                inject_semantic_context(&memory, action, &handoff_contexts).await;
+
+                let result = timeout(
+                    effective_step_timeout(step_timeout, pipeline_deadline),
+                    run_action_with_recovery(
+                        action,
+                        ActionCtx {
+                            assignments: assignments.clone(),
+                            workspace: workspace.clone(),
+                            handoff_contexts: handoff_contexts.clone(),
+                            slot_events: slot_events.clone(),
+                            event_sink: event_sink.clone(),
+                            failure_action: fa,
+                            skill,
+                        },
+                    ),
+                )
+                .await
+                .with_context(|| format!("workflow step timed out: {action}"))??;
+
+                let snippet = result.stdout.chars().take(500).collect::<String>();
+                memory.add(&result.step, &snippet);
+                last_health = Some(result.health);
+                controller.record_step(result.health);
+
+                emit_step(&event_sink, result.clone());
+                step_results.push(result);
             }
         }
     }
@@ -174,6 +256,20 @@ pub async fn run_local_pipeline_with_events(
         slot_events,
         handoff_contexts,
     })
+}
+
+/// Queries the semantic index and injects relevant snippets into the handoff context for a role.
+async fn inject_semantic_context(
+    memory: &MemoryIndex,
+    action: &str,
+    handoff_contexts: &Arc<Mutex<BTreeMap<String, HandoffContext>>>,
+) {
+    let hints = memory.search(action, 3);
+    if !hints.is_empty() {
+        let role = action_role(action);
+        let mut ctx = handoff_contexts.lock().await;
+        ctx.entry(role).or_default().semantic_hints = hints;
+    }
 }
 
 fn enforce_pipeline_deadline(deadline: Option<Instant>) -> anyhow::Result<()> {
@@ -220,6 +316,29 @@ workflow:
         let timeouts = workflow.workflow.timeouts.unwrap();
         assert_eq!(timeouts.step_minutes, Some(1));
         assert_eq!(timeouts.pipeline_minutes, Some(2));
+    }
+
+    #[test]
+    fn parses_conditional_step() {
+        let workflow = parse_workflow(
+            r#"
+workflow:
+  id: cond-test
+  name: Conditional Test
+  profile: quality-first
+  slots: {}
+  steps:
+    - architect.plan
+    - action: reviewer.audit
+      when_healthy: true
+"#,
+        )
+        .unwrap();
+        assert_eq!(workflow.workflow.steps.len(), 2);
+        assert!(matches!(
+            &workflow.workflow.steps[1],
+            WorkflowStep::Conditional { when_healthy: true, .. }
+        ));
     }
 
     #[tokio::test]

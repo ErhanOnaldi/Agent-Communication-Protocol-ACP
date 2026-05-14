@@ -151,6 +151,21 @@ VALUES
     ('claudex/deepseek', 'DeepSeek via Claudex', 'claudex', 'cheap', NULL, NULL, NULL);
 "#;
 
+pub(crate) const MIGRATION_4: &str = r#"
+CREATE TABLE IF NOT EXISTS step_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pipeline_id TEXT NOT NULL,
+    step_name TEXT NOT NULL,
+    role TEXT NOT NULL,
+    runtime_type TEXT,
+    model_id TEXT,
+    latency_ms INTEGER,
+    health TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+ALTER TABLE capability_scores ADD COLUMN last_updated_at TEXT
+"#;
+
 pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
         .execute(pool)
@@ -158,6 +173,7 @@ pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
     run_migration(pool, 1, MIGRATION_1).await?;
     run_migration(pool, 2, MIGRATION_2).await?;
     run_migration(pool, 3, MIGRATION_3).await?;
+    run_migration(pool, 4, MIGRATION_4).await?;
     Ok(())
 }
 

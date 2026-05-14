@@ -1,4 +1,4 @@
-use acp_protocol::{ModelRecord, PipelineRecord, PipelineStatus};
+use acp_protocol::{ModelRecord, PipelineRecord, PipelineStatus, RuntimeHealth, StepMetricsRecord};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -12,6 +12,7 @@ pub fn draw_dashboard(
     pipelines: &[PipelineRecord],
     models: &[ModelRecord],
     events: &[String],
+    metrics: &[StepMetricsRecord],
 ) {
     let area = frame.area();
     let vertical = Layout::default()
@@ -20,6 +21,7 @@ pub fn draw_dashboard(
             Constraint::Length(3),
             Constraint::Min(8),
             Constraint::Length(5),
+            Constraint::Length(6),
         ])
         .split(area);
 
@@ -99,4 +101,49 @@ pub fn draw_dashboard(
         )
         .style(Style::default().fg(Color::Gray));
     frame.render_widget(log, vertical[2]);
+
+    // Analytics panel: last N step metrics
+    let metric_items: Vec<ListItem> = metrics
+        .iter()
+        .rev()
+        .take(4)
+        .map(|m| {
+            let health_color = if m.health == RuntimeHealth::Healthy {
+                Color::Green
+            } else {
+                Color::Red
+            };
+            let latency = m
+                .latency_ms
+                .map(|v| format!("{v}ms"))
+                .unwrap_or_else(|| "–".to_string());
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<22}", truncate(&m.step_name, 21)),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!("{:<10}", m.health.to_string()),
+                    Style::default().fg(health_color),
+                ),
+                Span::styled(latency, Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+    let metrics_list = List::new(metric_items)
+        .block(
+            Block::default()
+                .title("Step analytics")
+                .borders(Borders::ALL),
+        )
+        .style(Style::default().fg(Color::Gray));
+    frame.render_widget(metrics_list, vertical[3]);
+}
+
+fn truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        s
+    } else {
+        &s[..max]
+    }
 }

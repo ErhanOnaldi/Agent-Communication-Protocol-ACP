@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use acp_protocol::{
     AgentSpec, RuntimeHealth, RuntimeType, SkillDefinition, SlotStatus, WorkflowFailurePolicy,
@@ -264,6 +264,7 @@ pub async fn run_action_with_recovery(
                 stdout: String::new(),
                 stderr: String::new(),
                 conflict: None,
+                latency_ms: 0,
             }))
         }
         FailureAction::AskUser => bail!(
@@ -290,6 +291,7 @@ pub async fn run_action_with_context(
     let agent_workspace = workspace.create_agent_workspace(&role, None).await?;
     let adapter = adapter_for(assignment.runtime_type);
     let task = build_task(action, &context, skill);
+    let t0 = Instant::now();
     let output = adapter
         .spawn(AgentSpec {
             agent_id: agent_workspace.agent_id.clone(),
@@ -302,6 +304,7 @@ pub async fn run_action_with_context(
             env: Default::default(),
         })
         .await?;
+    let latency_ms = t0.elapsed().as_millis() as u64;
 
     let conflict = match workspace.simulate_merge(&agent_workspace.branch).await {
         Ok(sim) if !sim.clean => {
@@ -329,6 +332,7 @@ pub async fn run_action_with_context(
         stdout: output.stdout,
         stderr: output.stderr,
         conflict,
+        latency_ms,
     })
 }
 

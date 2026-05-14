@@ -54,6 +54,7 @@ dependencies = [
  "acp-runtime",
  "acp-workspace",
  "anyhow",
+ "chrono",
  "serde_json",
  "serde_yaml",
  "tempfile",

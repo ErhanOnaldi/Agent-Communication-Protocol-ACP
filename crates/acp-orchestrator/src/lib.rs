@@ -1,13 +1,17 @@
+pub mod adaptive;
 pub mod memory;
 pub mod pipeline;
 pub mod recovery;
 pub mod scheduler;
+pub mod semantic;
 pub mod slots;
 
+pub use adaptive::AdaptiveController;
 pub use memory::HandoffContext;
 pub use pipeline::{parse_workflow, run_local_pipeline, run_local_pipeline_with_events};
 pub use recovery::FailureAction;
 pub use scheduler::{Assignment, Scheduler};
+pub use semantic::MemoryIndex;
 pub use slots::SlotLifecycleEvent;
 
 use std::collections::BTreeMap;
@@ -33,6 +37,8 @@ pub struct StepResult {
     pub stdout: String,
     pub stderr: String,
     pub conflict: Option<ConflictInfo>,
+    /// Wall-clock duration of the step execution in milliseconds.
+    pub latency_ms: u64,
 }
 
 #[derive(Debug, Clone)]

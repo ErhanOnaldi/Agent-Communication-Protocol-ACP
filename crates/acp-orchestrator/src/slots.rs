@@ -113,6 +113,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             conflict: None::<ConflictInfo>,
+            latency_ms: 0,
         };
         let fallback = fallback_assignment(&assignments, "backend", &failed).unwrap();
         assert_eq!(fallback.runtime_type, RuntimeType::Codex);

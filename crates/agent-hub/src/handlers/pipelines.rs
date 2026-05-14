@@ -1,7 +1,8 @@
 use agent_protocol::{
     ArtifactCreateRequest, ArtifactRecord, PipelineCreateRequest, PipelineEventCreateRequest,
     PipelineEventRecord, PipelineRecord, PipelineStatus, PipelineStatusUpdateRequest, RoleSlot,
-    SlotStatus, SlotUpdateRequest, WorkflowConfig, WorkingContext, WorkingContextUpsertRequest,
+    SlotStatus, SlotUpdateRequest, StepMetricCreateRequest, StepMetricsRecord, WorkflowConfig,
+    WorkingContext, WorkingContextUpsertRequest,
 };
 use axum::{
     extract::{Path, State},
@@ -15,7 +16,7 @@ use crate::{
     authorize,
     db::{
         get_pipeline_by_id, get_pipeline_event_by_id, get_slot_by_role, insert_pipeline_event,
-        row_to_artifact, row_to_pipeline, row_to_pipeline_event, row_to_slot,
+        insert_step_metric, row_to_artifact, row_to_pipeline, row_to_pipeline_event, row_to_slot,
         row_to_working_context,
     },
     ApiError, HubState,
@@ -333,4 +334,16 @@ pub(crate) async fn upsert_working_context(
     .execute(state.pool())
     .await?;
     get_working_context(State(state), headers, Path((pipeline_id, role))).await
+}
+
+pub(crate) async fn create_step_metric(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Path(pipeline_id): Path<Uuid>,
+    Json(mut req): Json<StepMetricCreateRequest>,
+) -> Result<Json<StepMetricsRecord>, ApiError> {
+    authorize(&state, &headers)?;
+    req.pipeline_id = pipeline_id;
+    let record = insert_step_metric(state.pool(), &req).await?;
+    Ok(Json(record))
 }

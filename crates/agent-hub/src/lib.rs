@@ -29,9 +29,10 @@ use handlers::{
         broadcast_message, close_thread, create_message, get_thread_detail, list_messages,
         list_threads, mark_read, message_to_role, reply_to_message, reply_to_thread,
     },
+    analytics::get_pipeline_analytics,
     models::{list_capability_scores, list_models, update_capability_score},
     pipelines::{
-        create_artifact, create_pipeline, create_pipeline_event, get_pipeline,
+        create_artifact, create_pipeline, create_pipeline_event, create_step_metric, get_pipeline,
         get_working_context, list_pipeline_artifacts, list_pipeline_events, list_pipeline_slots,
         list_pipelines, update_pipeline_slot, update_pipeline_status, upsert_working_context,
     },
@@ -113,6 +114,14 @@ pub fn app(state: HubState) -> Router {
         .route(
             "/api/pipelines/:id/artifacts",
             post(create_artifact).get(list_pipeline_artifacts),
+        )
+        .route(
+            "/api/pipelines/:id/metrics",
+            post(create_step_metric),
+        )
+        .route(
+            "/api/analytics/pipelines/:id",
+            get(get_pipeline_analytics),
         )
         .route(
             "/api/memory/:pipeline_id/:role",

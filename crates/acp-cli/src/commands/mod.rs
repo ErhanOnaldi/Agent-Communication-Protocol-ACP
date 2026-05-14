@@ -1,3 +1,4 @@
+pub mod analytics;
 pub mod discover;
 pub mod persist;
 pub mod pipeline;

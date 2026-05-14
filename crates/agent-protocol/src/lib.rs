@@ -307,6 +307,8 @@ pub struct WorkflowSlot {
 pub enum WorkflowStep {
     Action(String),
     Parallel { parallel: Vec<String> },
+    /// Only runs if the previous step completed with Healthy status.
+    Conditional { action: String, when_healthy: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -569,6 +571,8 @@ pub struct CapabilityScoreRecord {
     pub capability: String,
     pub success_count: i64,
     pub failure_count: i64,
+    #[serde(default)]
+    pub last_updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -774,6 +778,52 @@ pub struct SkillDefinition {
     pub system_prompt: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepMetricCreateRequest {
+    pub pipeline_id: Uuid,
+    pub step_name: String,
+    pub role: String,
+    pub runtime_type: Option<RuntimeType>,
+    pub model_id: Option<String>,
+    pub latency_ms: Option<u64>,
+    pub health: RuntimeHealth,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepMetricsRecord {
+    pub id: i64,
+    pub pipeline_id: Uuid,
+    pub step_name: String,
+    pub role: String,
+    pub runtime_type: Option<RuntimeType>,
+    pub model_id: Option<String>,
+    pub latency_ms: Option<u64>,
+    pub health: RuntimeHealth,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineAnalyticsResponse {
+    pub pipeline_id: Uuid,
+    pub total_steps: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub p50_latency_ms: Option<u64>,
+    pub p95_latency_ms: Option<u64>,
+    pub steps: Vec<StepMetricsRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerInsights {
+    pub role: String,
+    pub runtime_type: RuntimeType,
+    pub model_id: Option<String>,
+    pub base_score: f64,
+    pub learned_delta: f64,
+    pub profile_boost: f64,
+    pub final_score: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

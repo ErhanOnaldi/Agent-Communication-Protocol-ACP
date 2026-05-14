@@ -1,7 +1,7 @@
 use acp_orchestrator::OrchestratorEvent;
 use acp_protocol::{
     ArtifactCreateRequest, CapabilityScoreUpdateRequest, PipelineEventCreateRequest, RuntimeHealth,
-    SlotUpdateRequest, WorkingContextUpsertRequest,
+    SlotUpdateRequest, StepMetricCreateRequest, WorkingContextUpsertRequest,
 };
 use agent_client::AgentClient;
 use uuid::Uuid;
@@ -69,6 +69,7 @@ pub async fn persist_orchestrator_event(
                             "health": result.health,
                             "runtime_type": result.runtime_type,
                             "model_id": result.model_id,
+                            "latency_ms": result.latency_ms,
                         }),
                         correlation_id: None,
                         causation_id: None,
@@ -87,6 +88,20 @@ pub async fn persist_orchestrator_event(
                             result.stdout, result.stderr
                         ),
                         created_by: result.role.clone(),
+                    },
+                )
+                .await?;
+            client
+                .create_step_metric(
+                    pipeline_id,
+                    &StepMetricCreateRequest {
+                        pipeline_id,
+                        step_name: result.step.clone(),
+                        role: result.role.clone(),
+                        runtime_type: Some(result.runtime_type),
+                        model_id: result.model_id.clone(),
+                        latency_ms: Some(result.latency_ms),
+                        health: result.health,
                     },
                 )
                 .await?;

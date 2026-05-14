@@ -34,8 +34,8 @@ pub async fn run_live_dashboard(hub_client: AgentClient) -> anyhow::Result<()> {
             interval.tick().await;
             let pipelines = client_bg.pipelines().await.unwrap_or_default();
             let models = client_bg.models().await.unwrap_or_default();
-            let events: Vec<String> = if let Some(p) = pipelines.first() {
-                client_bg
+            let (events, metrics) = if let Some(p) = pipelines.first() {
+                let evts: Vec<String> = client_bg
                     .pipeline_events(p.id)
                     .await
                     .unwrap_or_default()
@@ -49,14 +49,21 @@ pub async fn run_live_dashboard(hub_client: AgentClient) -> anyhow::Result<()> {
                             e.agent_id.as_deref().unwrap_or("-")
                         )
                     })
-                    .collect()
+                    .collect();
+                let mets = client_bg
+                    .pipeline_analytics(p.id)
+                    .await
+                    .map(|a| a.steps)
+                    .unwrap_or_default();
+                (evts, mets)
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
             let mut s = state_bg.lock().unwrap();
             s.pipelines = pipelines;
             s.models = models;
             s.events = events;
+            s.metrics = metrics;
             if s.quit {
                 break;
             }
@@ -72,8 +79,9 @@ pub async fn run_live_dashboard(hub_client: AgentClient) -> anyhow::Result<()> {
             let pipelines = s.pipelines.clone();
             let models = s.models.clone();
             let events = s.events.clone();
+            let metrics = s.metrics.clone();
             drop(s);
-            terminal.draw(|frame| draw_dashboard(frame, &pipelines, &models, &events))?;
+            terminal.draw(|frame| draw_dashboard(frame, &pipelines, &models, &events, &metrics))?;
         }
 
         if event::poll(Duration::from_millis(200))? {

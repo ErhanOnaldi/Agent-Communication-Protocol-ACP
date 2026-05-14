@@ -1,5 +1,6 @@
 use acp_protocol::{
-    CapabilityScoreRecord, ModelRecord, RuntimeType, SchedulerProfile, WorkflowSlot,
+    CapabilityScoreRecord, ModelRecord, RuntimeType, SchedulerInsights, SchedulerProfile,
+    WorkflowSlot,
 };
 
 #[derive(Debug, Clone)]
@@ -68,28 +69,54 @@ impl Scheduler {
         slot: &WorkflowSlot,
         profile: SchedulerProfile,
     ) -> anyhow::Result<Vec<Assignment>> {
-        let mut candidates = Vec::new();
+        Ok(self
+            .candidates_with_insights(role, slot, profile)?
+            .into_iter()
+            .map(|(a, _)| a)
+            .collect())
+    }
+
+    /// Returns candidates paired with their score breakdown for observability.
+    pub fn candidates_with_insights(
+        &self,
+        role: &str,
+        slot: &WorkflowSlot,
+        profile: SchedulerProfile,
+    ) -> anyhow::Result<Vec<(Assignment, SchedulerInsights)>> {
+        let mut results = Vec::new();
         for preference in &slot.preferred {
             let model = preference
                 .model
                 .as_ref()
                 .and_then(|id| self.models.iter().find(|m| m.id == *id));
-            candidates.push(Assignment {
-                role: role.to_string(),
-                runtime_type: preference.runtime,
-                model_id: preference.model.clone(),
-                score: self.score(slot, preference.runtime, model, profile),
-            });
+            let (score, insights) =
+                self.score_with_insights(role, slot, preference.runtime, model, profile);
+            results.push((
+                Assignment {
+                    role: role.to_string(),
+                    runtime_type: preference.runtime,
+                    model_id: preference.model.clone(),
+                    score,
+                },
+                insights,
+            ));
         }
-        if candidates.is_empty() {
-            candidates.push(self.assign(role, slot, profile)?);
+        if results.is_empty() {
+            let a = self.assign(role, slot, profile)?;
+            let model = a
+                .model_id
+                .as_ref()
+                .and_then(|id| self.models.iter().find(|m| m.id == *id));
+            let (score, insights) =
+                self.score_with_insights(role, slot, a.runtime_type, model, profile);
+            results.push((Assignment { score, ..a }, insights));
         }
-        candidates.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
+        results.sort_by(|a, b| {
+            b.0.score
+                .partial_cmp(&a.0.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        Ok(candidates)
+        Ok(results)
     }
 
     pub(crate) fn score(
@@ -99,6 +126,18 @@ impl Scheduler {
         model: Option<&ModelRecord>,
         profile: SchedulerProfile,
     ) -> f64 {
+        self.score_with_insights("", slot, runtime_type, model, profile)
+            .0
+    }
+
+    fn score_with_insights(
+        &self,
+        role: &str,
+        slot: &WorkflowSlot,
+        runtime_type: RuntimeType,
+        model: Option<&ModelRecord>,
+        profile: SchedulerProfile,
+    ) -> (f64, SchedulerInsights) {
         let capability_match = if slot.required_capabilities.is_empty() {
             1.0
         } else {
@@ -127,20 +166,36 @@ impl Scheduler {
         } else {
             0.7
         };
-        let mut score = (capability_match * 0.30)
+
+        let base_score = (capability_match * 0.30)
             + (runtime_quality * 0.25)
             + (cost_efficiency * 0.20)
             + (context_fit * 0.15)
             + (latency * 0.10);
-        match profile {
-            SchedulerProfile::BudgetFirst => score += cost_efficiency * 0.10,
-            SchedulerProfile::SpeedFirst => score += latency * 0.10,
-            SchedulerProfile::QualityFirst => score += runtime_quality * 0.10,
-        }
-        if let Some(model) = model {
-            score += self.learned_boost(runtime_type, &model.id, &slot.required_capabilities);
-        }
-        score
+
+        let profile_boost = match profile {
+            SchedulerProfile::BudgetFirst => cost_efficiency * 0.10,
+            SchedulerProfile::SpeedFirst => latency * 0.10,
+            SchedulerProfile::QualityFirst => runtime_quality * 0.10,
+        };
+
+        let learned_delta = model
+            .map(|m| self.learned_boost(runtime_type, &m.id, &slot.required_capabilities))
+            .unwrap_or(0.0);
+
+        let final_score = base_score + profile_boost + learned_delta;
+
+        let insights = SchedulerInsights {
+            role: role.to_string(),
+            runtime_type,
+            model_id: model.map(|m| m.id.clone()),
+            base_score,
+            learned_delta,
+            profile_boost,
+            final_score,
+        };
+
+        (final_score, insights)
     }
 
     fn learned_boost(
@@ -152,6 +207,7 @@ impl Scheduler {
         if capabilities.is_empty() || self.capability_scores.is_empty() {
             return 0.0;
         }
+        let now = chrono::Utc::now();
         let mut total = 0.0;
         let mut count = 0usize;
         for cap in capabilities {
@@ -161,8 +217,16 @@ impl Scheduler {
                 let n = rec.success_count + rec.failure_count;
                 if n >= 5 {
                     let rate = rec.success_count as f64 / n as f64;
-                    // Maps success_rate [0,1] -> learned adjustment [-0.10, +0.10]
-                    total += (rate - 0.5) * 0.20;
+                    // Maps success_rate [0,1] -> adjustment [-0.10, +0.10]
+                    let mut delta = (rate - 0.5) * 0.20;
+                    // Time decay: halve weight if record older than 7 days
+                    if let Some(updated) = rec.last_updated_at {
+                        let age_days = (now - updated).num_days();
+                        if age_days > 7 {
+                            delta *= 0.5_f64.powi((age_days / 7) as i32);
+                        }
+                    }
+                    total += delta;
                     count += 1;
                 }
             }
@@ -200,6 +264,7 @@ mod tests {
             capability: "rust".to_string(),
             success_count: 9,
             failure_count: 1,
+            last_updated_at: None,
         }];
         let scheduler = Scheduler::new(vec![model]).with_scores(scores);
         let slot = WorkflowSlot {
@@ -217,5 +282,77 @@ mod tests {
             SchedulerProfile::QualityFirst,
         );
         assert!(with_model > base);
+    }
+
+    #[test]
+    fn time_decay_reduces_old_scores() {
+        let model = ModelRecord {
+            id: "m1".to_string(),
+            name: "M1".to_string(),
+            runtime_source: "codex".to_string(),
+            tier: ModelTier::Premium,
+            context_window: None,
+            pricing: ModelPricing { input: None, output: None },
+        };
+        let old_date = chrono::Utc::now() - chrono::Duration::days(30);
+        let recent_date = chrono::Utc::now() - chrono::Duration::days(1);
+        let make_score = |last_updated_at| CapabilityScoreRecord {
+            runtime_type: RuntimeType::Codex,
+            model_id: "m1".to_string(),
+            capability: "rust".to_string(),
+            success_count: 9,
+            failure_count: 1,
+            last_updated_at,
+        };
+        let slot = WorkflowSlot {
+            role: "backend".to_string(),
+            runtime_mode: None,
+            preferred: vec![],
+            required_capabilities: vec!["rust".to_string()],
+            optional: false,
+        };
+        let sched_old = Scheduler::new(vec![model.clone()])
+            .with_scores(vec![make_score(Some(old_date))]);
+        let sched_recent = Scheduler::new(vec![model.clone()])
+            .with_scores(vec![make_score(Some(recent_date))]);
+        let score_old = sched_old.score(
+            &slot, RuntimeType::Codex, sched_old.models.first(), SchedulerProfile::QualityFirst,
+        );
+        let score_recent = sched_recent.score(
+            &slot, RuntimeType::Codex, sched_recent.models.first(), SchedulerProfile::QualityFirst,
+        );
+        assert!(score_recent > score_old, "recent score {score_recent} should exceed old {score_old}");
+    }
+
+    #[test]
+    fn candidates_with_insights_returns_breakdown() {
+        use acp_protocol::RuntimePreference;
+        let model = ModelRecord {
+            id: "c1".to_string(),
+            name: "C1".to_string(),
+            runtime_source: "codex".to_string(),
+            tier: ModelTier::Premium,
+            context_window: None,
+            pricing: ModelPricing { input: None, output: None },
+        };
+        let scheduler = Scheduler::new(vec![model]);
+        let slot = WorkflowSlot {
+            role: "dev".to_string(),
+            runtime_mode: None,
+            preferred: vec![RuntimePreference {
+                runtime: RuntimeType::Codex,
+                model: Some("c1".to_string()),
+                provider: None,
+            }],
+            required_capabilities: vec![],
+            optional: false,
+        };
+        let results = scheduler
+            .candidates_with_insights("dev", &slot, SchedulerProfile::QualityFirst)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        let (assignment, insights) = &results[0];
+        assert!(insights.final_score > 0.0);
+        assert_eq!(assignment.role, "dev");
     }
 }

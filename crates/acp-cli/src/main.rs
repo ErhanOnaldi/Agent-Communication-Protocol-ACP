@@ -8,6 +8,7 @@ mod commands;
 mod tui;
 
 use commands::{
+    analytics::{handle_analytics, AnalyticsCommand},
     discover::{handle_doctor, handle_models, handle_provider, ProviderCommand},
     pipeline::{handle_pipeline, PipelineCommand},
     skill::{handle_skill, SkillCommand},
@@ -54,6 +55,10 @@ enum Command {
         #[command(subcommand)]
         command: SkillCommand,
     },
+    Analytics {
+        #[command(subcommand)]
+        command: AnalyticsCommand,
+    },
     Workspace {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
@@ -79,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Pipeline { command } => handle_pipeline(command, &cli, &config).await?,
         Command::Slot { command } => handle_slot(command, &cli).await?,
         Command::Skill { command } => handle_skill(command, &config, cli.json).await?,
+        Command::Analytics { command } => handle_analytics(command, &cli).await?,
         Command::Workspace { repo } => handle_workspace_status(repo).await?,
         Command::Doctor => handle_doctor(&config).await?,
         Command::Dashboard => {

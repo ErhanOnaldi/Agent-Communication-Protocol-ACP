@@ -4,11 +4,12 @@ use agent_protocol::{
     AgentRecord, ArtifactCreateRequest, ArtifactRecord, BroadcastRequest, CapabilityScoreRecord,
     CapabilityScoreUpdateRequest, FileClaimRecord, FileClaimRequest, FileClaimResponse,
     FindingCreateRequest, FindingRecord, HeartbeatRequest, MessageCreateRequest, MessageKind,
-    MessageRecord, MessageStatus, ModelRecord, PipelineCreateRequest, PipelineEventCreateRequest,
-    PipelineEventRecord, PipelineRecord, PipelineStatusUpdateRequest, ReplyRequest,
-    RoleMessageRequest, RoleSlot, SlotUpdateRequest, TaskClaimRequest, TaskCreateRequest,
-    TaskRecord, TaskStatusRequest, ThreadDetail, ThreadRecord, UpdateAgentStatusRequest,
-    WorkingContext, WorkingContextUpsertRequest,
+    MessageRecord, MessageStatus, ModelRecord, PipelineAnalyticsResponse, PipelineCreateRequest,
+    PipelineEventCreateRequest, PipelineEventRecord, PipelineRecord, PipelineStatusUpdateRequest,
+    ReplyRequest, RoleMessageRequest, RoleSlot, SlotUpdateRequest, StepMetricCreateRequest,
+    StepMetricsRecord, TaskClaimRequest, TaskCreateRequest, TaskRecord, TaskStatusRequest,
+    ThreadDetail, ThreadRecord, UpdateAgentStatusRequest, WorkingContext,
+    WorkingContextUpsertRequest,
 };
 use anyhow::{bail, Context};
 use futures_util::StreamExt;
@@ -227,6 +228,22 @@ impl AgentClient {
     ) -> anyhow::Result<ArtifactRecord> {
         self.post(&format!("/api/pipelines/{id}/artifacts"), req)
             .await
+    }
+
+    pub async fn create_step_metric(
+        &self,
+        id: Uuid,
+        req: &StepMetricCreateRequest,
+    ) -> anyhow::Result<StepMetricsRecord> {
+        self.post(&format!("/api/pipelines/{id}/metrics"), req)
+            .await
+    }
+
+    pub async fn pipeline_analytics(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<PipelineAnalyticsResponse> {
+        self.get(&format!("/api/analytics/pipelines/{id}")).await
     }
 
     pub async fn working_context(

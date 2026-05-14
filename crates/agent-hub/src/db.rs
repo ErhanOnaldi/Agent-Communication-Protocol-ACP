@@ -1,8 +1,9 @@
 use agent_protocol::{
     AgentRecord, ArtifactRecord, CapabilityScoreRecord, FileClaimRecord, FindingKind, FindingRecord,
     MessageCreateRequest, MessageKind, MessageRecord, MessageStatus, ModelPricing, ModelRecord,
-    ModelTier, PipelineEventRecord, PipelineRecord, PipelineStatus, RoleSlot, RuntimeType,
-    SchedulerProfile, SlotStatus, TaskRecord, TaskStatus, ThreadRecord, WorkingContext,
+    ModelTier, PipelineAnalyticsResponse, PipelineEventRecord, PipelineRecord, PipelineStatus,
+    RoleSlot, RuntimeHealth, RuntimeType, SchedulerProfile, SlotStatus, StepMetricCreateRequest,
+    StepMetricsRecord, TaskRecord, TaskStatus, ThreadRecord, WorkingContext,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
@@ -136,6 +137,10 @@ pub(crate) fn row_to_model(row: SqliteRow) -> Result<ModelRecord, ApiError> {
 
 pub(crate) fn row_to_capability_score(row: SqliteRow) -> Result<CapabilityScoreRecord, ApiError> {
     let runtime_type: String = row.try_get("runtime_type")?;
+    let last_updated_at = row
+        .try_get::<Option<String>, _>("last_updated_at")?
+        .map(parse_time)
+        .transpose()?;
     Ok(CapabilityScoreRecord {
         runtime_type: runtime_type
             .parse::<RuntimeType>()
@@ -144,6 +149,7 @@ pub(crate) fn row_to_capability_score(row: SqliteRow) -> Result<CapabilityScoreR
         capability: row.try_get("capability")?,
         success_count: row.try_get("success_count")?,
         failure_count: row.try_get("failure_count")?,
+        last_updated_at,
     })
 }
 
@@ -513,4 +519,112 @@ pub(crate) async fn write_event(
         .execute(pool)
         .await?;
     Ok(())
+}
+
+pub(crate) async fn insert_step_metric(
+    pool: &SqlitePool,
+    req: &StepMetricCreateRequest,
+) -> Result<StepMetricsRecord, ApiError> {
+    let pipeline_id = req.pipeline_id.to_string();
+    let runtime_type = req.runtime_type.map(|r| r.to_string());
+    let health = req.health.to_string();
+    let now = Utc::now().to_rfc3339();
+    let latency = req.latency_ms.map(|v| v as i64);
+    let id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO step_metrics (pipeline_id, step_name, role, runtime_type, model_id, latency_ms, health, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) RETURNING id",
+    )
+    .bind(&pipeline_id)
+    .bind(&req.step_name)
+    .bind(&req.role)
+    .bind(&runtime_type)
+    .bind(&req.model_id)
+    .bind(latency)
+    .bind(&health)
+    .bind(&now)
+    .fetch_one(pool)
+    .await?;
+    Ok(StepMetricsRecord {
+        id,
+        pipeline_id: req.pipeline_id,
+        step_name: req.step_name.clone(),
+        role: req.role.clone(),
+        runtime_type: req.runtime_type,
+        model_id: req.model_id.clone(),
+        latency_ms: req.latency_ms,
+        health: req.health,
+        created_at: parse_time(now)?,
+    })
+}
+
+pub(crate) async fn pipeline_step_metrics(
+    pool: &SqlitePool,
+    pipeline_id: Uuid,
+) -> Result<Vec<StepMetricsRecord>, ApiError> {
+    let pid = pipeline_id.to_string();
+    let rows = sqlx::query(
+        "SELECT id, pipeline_id, step_name, role, runtime_type, model_id, latency_ms, health, created_at
+         FROM step_metrics WHERE pipeline_id = ?1 ORDER BY id ASC",
+    )
+    .bind(&pid)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(row_to_step_metric).collect()
+}
+
+fn row_to_step_metric(row: SqliteRow) -> Result<StepMetricsRecord, ApiError> {
+    let pipeline_id = parse_uuid(row.try_get::<String, _>("pipeline_id")?)?;
+    let runtime_type = row
+        .try_get::<Option<String>, _>("runtime_type")?
+        .map(|s| s.parse::<RuntimeType>().map_err(ApiError::bad_request))
+        .transpose()?;
+    let health: String = row.try_get("health")?;
+    let latency_ms = row.try_get::<Option<i64>, _>("latency_ms")?.map(|v| v as u64);
+    Ok(StepMetricsRecord {
+        id: row.try_get("id")?,
+        pipeline_id,
+        step_name: row.try_get("step_name")?,
+        role: row.try_get("role")?,
+        runtime_type,
+        model_id: row.try_get("model_id")?,
+        latency_ms,
+        health: health.parse::<RuntimeHealth>().map_err(ApiError::bad_request)?,
+        created_at: parse_time(row.try_get::<String, _>("created_at")?)?,
+    })
+}
+
+pub(crate) async fn pipeline_analytics(
+    pool: &SqlitePool,
+    pipeline_id: Uuid,
+) -> Result<PipelineAnalyticsResponse, ApiError> {
+    let steps = pipeline_step_metrics(pool, pipeline_id).await?;
+    let total_steps = steps.len();
+    let succeeded = steps
+        .iter()
+        .filter(|s| s.health == RuntimeHealth::Healthy)
+        .count();
+    let failed = total_steps - succeeded;
+
+    let mut latencies: Vec<u64> = steps.iter().filter_map(|s| s.latency_ms).collect();
+    latencies.sort_unstable();
+    let p50 = percentile(&latencies, 50);
+    let p95 = percentile(&latencies, 95);
+
+    Ok(PipelineAnalyticsResponse {
+        pipeline_id,
+        total_steps,
+        succeeded,
+        failed,
+        p50_latency_ms: p50,
+        p95_latency_ms: p95,
+        steps,
+    })
+}
+
+fn percentile(sorted: &[u64], pct: usize) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let idx = (pct * sorted.len()).saturating_sub(1) / 100;
+    Some(sorted[idx.min(sorted.len() - 1)])
 }
