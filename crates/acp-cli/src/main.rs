@@ -18,6 +18,7 @@ use commands::{
     slot::{handle_slot, SlotCommand},
     workspace::handle_workspace_status,
 };
+use tui::HomeAction;
 
 #[derive(Debug, Parser)]
 #[command(name = "acp", about = "ACP runtime orchestration CLI")]
@@ -31,7 +32,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -89,24 +90,52 @@ async fn main() -> anyhow::Result<()> {
     if let Some(acp_home) = &cli.acp_home {
         config.acp_home = acp_home.clone();
     }
-    match cli.command.clone() {
+
+    if let Some(command) = cli.command.clone() {
+        return run_command(command, &cli, &config).await;
+    }
+
+    // Interactive home-menu loop: returns here after each command.
+    loop {
+        let action = tui::run_home().await?;
+        let (command, needs_pause) = match action {
+            HomeAction::Doctor => (Command::Doctor, true),
+            HomeAction::Discover => (Command::Discover, true),
+            HomeAction::Models => (Command::Models { tier: None }, true),
+            HomeAction::Dashboard => (Command::Dashboard, false),
+            HomeAction::Quit => break,
+        };
+        if let Err(e) = run_command(command, &cli, &config).await {
+            eprintln!("\nError: {e}");
+        }
+        if needs_pause {
+            eprintln!("\nPress Enter to return to the menu…");
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+        }
+    }
+    Ok(())
+}
+
+async fn run_command(command: Command, cli: &Cli, config: &DiscoveryConfig) -> anyhow::Result<()> {
+    match command {
         Command::Discover | Command::Runtimes => {
             let runtimes = acp_discover::discover_runtimes().await;
             client::print_yaml(cli.json, &runtimes)?;
         }
-        Command::Models { tier } => handle_models(tier, &cli).await?,
-        Command::Provider { command } => handle_provider(command, &config, cli.json).await?,
-        Command::Pipeline { command } => handle_pipeline(command, &cli, &config).await?,
-        Command::Slot { command } => handle_slot(command, &cli).await?,
-        Command::Skill { command } => handle_skill(command, &config, cli.json).await?,
-        Command::Analytics { command } => handle_analytics(command, &cli).await?,
-        Command::Mcp { command } => handle_mcp(command, &config, &cli).await?,
-        Command::Runtime { command } => handle_runtime(command, &cli).await?,
-        Command::Memory { command } => handle_memory(command, &cli).await?,
+        Command::Models { tier } => handle_models(tier, cli).await?,
+        Command::Provider { command } => handle_provider(command, config, cli.json).await?,
+        Command::Pipeline { command } => handle_pipeline(command, cli, config).await?,
+        Command::Slot { command } => handle_slot(command, cli).await?,
+        Command::Skill { command } => handle_skill(command, config, cli.json).await?,
+        Command::Analytics { command } => handle_analytics(command, cli).await?,
+        Command::Mcp { command } => handle_mcp(command, config, cli).await?,
+        Command::Runtime { command } => handle_runtime(command, cli).await?,
+        Command::Memory { command } => handle_memory(command, cli).await?,
         Command::Workspace { repo } => handle_workspace_status(repo).await?,
-        Command::Doctor => handle_doctor(&config).await?,
+        Command::Doctor => handle_doctor(config).await?,
         Command::Dashboard => {
-            let hub_client = client::client(&cli)?;
+            let hub_client = client::client(cli)?;
             tui::run_live_dashboard(hub_client).await?;
         }
     }

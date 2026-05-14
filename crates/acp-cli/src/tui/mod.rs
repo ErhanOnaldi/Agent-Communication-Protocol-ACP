@@ -1,4 +1,5 @@
 pub mod draw;
+pub mod home;
 pub mod state;
 
 use std::{
@@ -16,6 +17,8 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use self::{draw::draw_dashboard, state::DashboardState};
+
+pub use home::{run_home, HomeAction};
 
 pub async fn run_live_dashboard(hub_client: AgentClient) -> anyhow::Result<()> {
     enable_raw_mode()?;

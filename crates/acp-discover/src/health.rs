@@ -1,4 +1,6 @@
 use acp_protocol::{McpHealth, ModelRecord, RuntimeHealth};
+use std::time::Duration;
+use tokio::time::timeout;
 
 use crate::{
     mcp::load_mcp_config,
@@ -24,14 +26,18 @@ pub async fn doctor(config: &DiscoveryConfig) -> anyhow::Result<DoctorReport> {
     let mcp_config = load_mcp_config(config)?;
     let mut mcp = Vec::new();
     for (name, server) in mcp_config.servers {
-        let status = match tokio::process::Command::new(&server.command)
-            .arg("--version")
-            .output()
-            .await
-        {
-            Ok(output) if output.status.success() => RuntimeHealth::Healthy,
-            Ok(_) => RuntimeHealth::Degraded,
-            Err(_) => RuntimeHealth::Missing,
+        let probe = timeout(
+            Duration::from_secs(3),
+            tokio::process::Command::new(&server.command)
+                .arg("--version")
+                .output(),
+        )
+        .await;
+        let status = match probe {
+            Ok(Ok(output)) if output.status.success() => RuntimeHealth::Healthy,
+            Ok(Ok(_)) => RuntimeHealth::Degraded,
+            Ok(Err(_)) => RuntimeHealth::Missing,
+            Err(_) => RuntimeHealth::Degraded,
         };
         mcp.push(McpHealth {
             name,

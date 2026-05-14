@@ -1,8 +1,11 @@
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use acp_protocol::{RuntimeHealth, RuntimeRecord, RuntimeType};
+use anyhow::Context;
 use tokio::process::Command;
+use tokio::time::timeout;
 
 pub async fn discover_runtimes() -> Vec<RuntimeRecord> {
     let specs = [
@@ -48,7 +51,12 @@ pub fn which(binary: &str) -> Option<PathBuf> {
 }
 
 async fn command_version(binary: &str) -> anyhow::Result<String> {
-    let output = Command::new(binary).arg("--version").output().await?;
+    let output = timeout(
+        Duration::from_secs(3),
+        Command::new(binary).arg("--version").output(),
+    )
+    .await
+    .with_context(|| format!("{binary} --version timed out"))??;
     let text = if output.stdout.is_empty() {
         String::from_utf8_lossy(&output.stderr).to_string()
     } else {
