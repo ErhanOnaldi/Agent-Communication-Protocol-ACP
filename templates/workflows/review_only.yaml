@@ -1,0 +1,23 @@
+workflow:
+  id: review-only
+  name: "Review Only"
+  profile: quality-first
+  slots:
+    reviewer:
+      role: reviewer
+      runtime_mode: external
+      preferred:
+        - runtime: claude-code
+          model: claude-code/default
+        - runtime: codex
+          model: codex/default
+      required_capabilities: [code-review]
+      optional: false
+  steps:
+    - reviewer.audit
+  failure:
+    default: retry(1)
+  timeouts:
+    step_minutes: 30
+    pipeline_minutes: 60
+

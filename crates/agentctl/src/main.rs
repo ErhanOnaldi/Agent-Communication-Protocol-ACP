@@ -547,12 +547,8 @@ fn required<'a>(value: Option<&'a String>, name: &str) -> anyhow::Result<&'a str
         .with_context(|| format!("{name} must be set"))
 }
 
-fn print_value<T: serde::Serialize>(json: bool, value: &T) -> anyhow::Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(value)?);
-    } else {
-        println!("{}", serde_json::to_string_pretty(value)?);
-    }
+fn print_value<T: serde::Serialize>(_json: bool, value: &T) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 

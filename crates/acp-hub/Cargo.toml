@@ -1,0 +1,19 @@
+[package]
+name = "acp-hub"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+agent-hub = { path = "../agent-hub" }
+anyhow.workspace = true
+axum.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "acp-hub"
+path = "src/main.rs"
+

@@ -1,11 +1,14 @@
 use std::time::Duration;
 
 use agent_protocol::{
-    AgentRecord, BroadcastRequest, FileClaimRecord, FileClaimRequest, FileClaimResponse,
+    AgentRecord, ArtifactCreateRequest, ArtifactRecord, BroadcastRequest, CapabilityScoreRecord,
+    CapabilityScoreUpdateRequest, FileClaimRecord, FileClaimRequest, FileClaimResponse,
     FindingCreateRequest, FindingRecord, HeartbeatRequest, MessageCreateRequest, MessageKind,
-    MessageRecord, MessageStatus, ReplyRequest, RoleMessageRequest, TaskClaimRequest,
-    TaskCreateRequest, TaskRecord, TaskStatusRequest, ThreadDetail, ThreadRecord,
-    UpdateAgentStatusRequest,
+    MessageRecord, MessageStatus, ModelRecord, PipelineCreateRequest, PipelineEventCreateRequest,
+    PipelineEventRecord, PipelineRecord, PipelineStatusUpdateRequest, ReplyRequest,
+    RoleMessageRequest, RoleSlot, SlotUpdateRequest, TaskClaimRequest, TaskCreateRequest,
+    TaskRecord, TaskStatusRequest, ThreadDetail, ThreadRecord, UpdateAgentStatusRequest,
+    WorkingContext, WorkingContextUpsertRequest,
 };
 use anyhow::{bail, Context};
 use futures_util::StreamExt;
@@ -148,6 +151,101 @@ impl AgentClient {
         self.post(&format!("/api/tasks/{id}/done"), req).await
     }
 
+    pub async fn models(&self) -> anyhow::Result<Vec<ModelRecord>> {
+        self.get("/api/models").await
+    }
+
+    pub async fn capability_scores(&self) -> anyhow::Result<Vec<CapabilityScoreRecord>> {
+        self.get("/api/capability-scores").await
+    }
+
+    pub async fn update_capability_score(
+        &self,
+        req: &CapabilityScoreUpdateRequest,
+    ) -> anyhow::Result<CapabilityScoreRecord> {
+        self.post("/api/capability-scores", req).await
+    }
+
+    pub async fn create_pipeline(
+        &self,
+        req: &PipelineCreateRequest,
+    ) -> anyhow::Result<PipelineRecord> {
+        self.post("/api/pipelines", req).await
+    }
+
+    pub async fn pipelines(&self) -> anyhow::Result<Vec<PipelineRecord>> {
+        self.get("/api/pipelines").await
+    }
+
+    pub async fn pipeline(&self, id: Uuid) -> anyhow::Result<PipelineRecord> {
+        self.get(&format!("/api/pipelines/{id}")).await
+    }
+
+    pub async fn update_pipeline_status(
+        &self,
+        id: Uuid,
+        req: &PipelineStatusUpdateRequest,
+    ) -> anyhow::Result<PipelineRecord> {
+        self.post(&format!("/api/pipelines/{id}/status"), req).await
+    }
+
+    pub async fn pipeline_slots(&self, id: Uuid) -> anyhow::Result<Vec<RoleSlot>> {
+        self.get(&format!("/api/pipelines/{id}/slots")).await
+    }
+
+    pub async fn update_pipeline_slot(
+        &self,
+        id: Uuid,
+        role: &str,
+        req: &SlotUpdateRequest,
+    ) -> anyhow::Result<RoleSlot> {
+        self.post(&format!("/api/pipelines/{id}/slots/{role}"), req)
+            .await
+    }
+
+    pub async fn pipeline_events(&self, id: Uuid) -> anyhow::Result<Vec<PipelineEventRecord>> {
+        self.get(&format!("/api/pipelines/{id}/events")).await
+    }
+
+    pub async fn create_pipeline_event(
+        &self,
+        id: Uuid,
+        req: &PipelineEventCreateRequest,
+    ) -> anyhow::Result<PipelineEventRecord> {
+        self.post(&format!("/api/pipelines/{id}/events"), req).await
+    }
+
+    pub async fn pipeline_artifacts(&self, id: Uuid) -> anyhow::Result<Vec<ArtifactRecord>> {
+        self.get(&format!("/api/pipelines/{id}/artifacts")).await
+    }
+
+    pub async fn create_artifact(
+        &self,
+        id: Uuid,
+        req: &ArtifactCreateRequest,
+    ) -> anyhow::Result<ArtifactRecord> {
+        self.post(&format!("/api/pipelines/{id}/artifacts"), req)
+            .await
+    }
+
+    pub async fn working_context(
+        &self,
+        pipeline_id: Uuid,
+        role: &str,
+    ) -> anyhow::Result<WorkingContext> {
+        self.get(&format!("/api/memory/{pipeline_id}/{role}")).await
+    }
+
+    pub async fn upsert_working_context(
+        &self,
+        pipeline_id: Uuid,
+        role: &str,
+        req: &WorkingContextUpsertRequest,
+    ) -> anyhow::Result<WorkingContext> {
+        self.put(&format!("/api/memory/{pipeline_id}/{role}"), req)
+            .await
+    }
+
     pub async fn claim_file(&self, req: &FileClaimRequest) -> anyhow::Result<FileClaimResponse> {
         self.post("/api/file-claims", req).await
     }
@@ -255,6 +353,22 @@ impl AgentClient {
         decode_response(response).await
     }
 
+    async fn put<T, R>(&self, path: &str, body: &T) -> anyhow::Result<R>
+    where
+        T: serde::Serialize + ?Sized,
+        R: serde::de::DeserializeOwned,
+    {
+        let response = self
+            .client
+            .put(format!("{}{}", self.base_url, path))
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|err| friendly_request_error(err, &self.base_url))?;
+        decode_response(response).await
+    }
+
     async fn delete<R>(&self, path: &str) -> anyhow::Result<R>
     where
         R: serde::de::DeserializeOwned,
@@ -281,7 +395,7 @@ async fn decode_response<T: serde::de::DeserializeOwned>(
         }
         bail!("hub request failed ({status}): {text}");
     }
-    Ok(serde_json::from_str(&text).with_context(|| format!("invalid response: {text}"))?)
+    serde_json::from_str(&text).with_context(|| format!("invalid response: {text}"))
 }
 
 fn friendly_request_error(err: reqwest::Error, base_url: &str) -> anyhow::Error {

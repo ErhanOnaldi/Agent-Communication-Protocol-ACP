@@ -1,0 +1,9 @@
+[package]
+name = "acp-protocol"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
+

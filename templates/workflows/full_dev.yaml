@@ -1,0 +1,45 @@
+workflow:
+  id: full-dev
+  name: "Full Development"
+  profile: quality-first
+  slots:
+    architect:
+      role: architect
+      runtime_mode: external
+      preferred:
+        - runtime: claude-code
+          model: claude-code/default
+        - runtime: codex
+          model: codex/default
+      required_capabilities: [architecture, planning]
+      optional: false
+    backend:
+      role: backend
+      runtime_mode: auto
+      preferred:
+        - runtime: codex
+          model: codex/default
+        - runtime: claudex
+          model: claudex/qwen3-coder
+      required_capabilities: [coding]
+      optional: false
+    reviewer:
+      role: reviewer
+      runtime_mode: external
+      preferred:
+        - runtime: claude-code
+          model: claude-code/default
+      required_capabilities: [code-review]
+      optional: true
+  steps:
+    - architect.plan
+    - parallel:
+        - backend.implement
+    - reviewer.audit
+  failure:
+    default: retry(2)
+    overrides:
+      reviewer: skip
+  timeouts:
+    step_minutes: 30
+    pipeline_minutes: 180

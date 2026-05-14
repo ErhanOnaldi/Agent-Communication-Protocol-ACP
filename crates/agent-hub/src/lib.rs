@@ -1,11 +1,21 @@
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use agent_protocol::{
-    AgentRecord, AgentStatus, BroadcastRequest, ErrorResponse, FileClaimRecord, FileClaimRequest,
+    AgentRecord, AgentStatus, ArtifactCreateRequest, BroadcastRequest, CapabilityScoreRecord,
+    CapabilityScoreUpdateRequest, ErrorResponse, FileClaimRecord, FileClaimRequest,
     FileClaimResponse, FindingCreateRequest, FindingKind, FindingRecord, HeartbeatRequest,
-    MessageCreateRequest, MessageKind, MessageRecord, MessageStatus, ReplyRequest,
-    RoleMessageRequest, TaskClaimRequest, TaskCreateRequest, TaskPriority, TaskRecord, TaskStatus,
-    TaskStatusRequest, ThreadDetail, ThreadRecord, UpdateAgentStatusRequest,
+    MessageCreateRequest, MessageKind, MessageRecord, MessageStatus, ModelPricing, ModelRecord,
+    ModelTier, PipelineCreateRequest, PipelineEventCreateRequest, PipelineEventRecord,
+    PipelineRecord, PipelineStatus, PipelineStatusUpdateRequest, ReplyRequest, RoleMessageRequest,
+    RoleSlot, RuntimeType, SchedulerProfile, SlotStatus, SlotUpdateRequest, TaskClaimRequest,
+    TaskCreateRequest, TaskPriority, TaskRecord, TaskStatus, TaskStatusRequest, ThreadDetail,
+    ThreadRecord, UpdateAgentStatusRequest, WorkflowConfig, WorkingContext,
+    WorkingContextUpsertRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -34,6 +44,13 @@ struct HubStateInner {
     pool: SqlitePool,
     token: String,
     events: broadcast::Sender<MessageRecord>,
+    rate_limits: Mutex<HashMap<String, RateBucket>>,
+}
+
+#[derive(Debug, Clone)]
+struct RateBucket {
+    window_started: Instant,
+    count: u32,
 }
 
 impl HubState {
@@ -44,6 +61,7 @@ impl HubState {
                 pool,
                 token,
                 events,
+                rate_limits: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -74,6 +92,28 @@ pub fn app(state: HubState) -> Router {
         .route("/api/tasks/:id/claim", post(claim_task))
         .route("/api/tasks/:id/status", post(update_task_status))
         .route("/api/tasks/:id/done", post(done_task))
+        .route("/api/models", get(list_models))
+        .route(
+            "/api/capability-scores",
+            post(update_capability_score).get(list_capability_scores),
+        )
+        .route("/api/pipelines", post(create_pipeline).get(list_pipelines))
+        .route("/api/pipelines/:id", get(get_pipeline))
+        .route("/api/pipelines/:id/status", post(update_pipeline_status))
+        .route("/api/pipelines/:id/slots", get(list_pipeline_slots))
+        .route("/api/pipelines/:id/slots/:role", post(update_pipeline_slot))
+        .route(
+            "/api/pipelines/:id/events",
+            post(create_pipeline_event).get(list_pipeline_events),
+        )
+        .route(
+            "/api/pipelines/:id/artifacts",
+            post(create_artifact).get(list_pipeline_artifacts),
+        )
+        .route(
+            "/api/memory/:pipeline_id/:role",
+            get(get_working_context).put(upsert_working_context),
+        )
         .route(
             "/api/file-claims",
             post(create_file_claim).get(list_file_claims),
@@ -93,6 +133,7 @@ pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
         .await?;
     run_migration(pool, 1, MIGRATION_1).await?;
     run_migration(pool, 2, MIGRATION_2).await?;
+    run_migration(pool, 3, MIGRATION_3).await?;
     Ok(())
 }
 
@@ -190,6 +231,80 @@ CREATE TABLE IF NOT EXISTS findings (
     confidence TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+"#;
+
+const MIGRATION_3: &str = r#"
+CREATE TABLE IF NOT EXISTS models (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    runtime_source TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    context_window INTEGER NULL,
+    pricing_input REAL NULL,
+    pricing_output REAL NULL
+);
+CREATE TABLE IF NOT EXISTS pipelines (
+    id TEXT PRIMARY KEY,
+    workflow_yaml TEXT NOT NULL,
+    status TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT NULL
+);
+CREATE TABLE IF NOT EXISTS slots (
+    id TEXT PRIMARY KEY,
+    pipeline_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    runtime_type TEXT NULL,
+    model_id TEXT NULL,
+    agent_id TEXT NULL,
+    status TEXT NOT NULL DEFAULT 'empty',
+    capabilities_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS pipeline_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pipeline_id TEXT NOT NULL,
+    agent_id TEXT NULL,
+    event_type TEXT NOT NULL,
+    payload JSON NOT NULL,
+    correlation_id TEXT NULL,
+    causation_id TEXT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS artifacts (
+    id TEXT PRIMARY KEY,
+    pipeline_id TEXT NOT NULL,
+    stage_name TEXT NOT NULL,
+    artifact_type TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS working_context (
+    pipeline_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    key_decisions JSON NOT NULL,
+    active_files JSON NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (pipeline_id, role)
+);
+CREATE TABLE IF NOT EXISTS capability_scores (
+    runtime_type TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (runtime_type, model_id, capability)
+);
+INSERT OR IGNORE INTO models (id, name, runtime_source, tier, context_window, pricing_input, pricing_output)
+VALUES
+    ('claude-code/default', 'Claude Code default', 'claude_code', 'premium', NULL, NULL, NULL),
+    ('codex/default', 'Codex default', 'codex', 'premium', NULL, NULL, NULL),
+    ('gemini/default', 'Gemini default', 'gemini', 'standard', NULL, NULL, NULL),
+    ('copilot/default', 'GitHub Copilot default', 'copilot', 'standard', NULL, NULL, NULL),
+    ('claudex/qwen3-coder', 'Qwen3 Coder via Claudex', 'claudex', 'cheap', NULL, NULL, NULL),
+    ('claudex/deepseek', 'DeepSeek via Claudex', 'claudex', 'cheap', NULL, NULL, NULL);
 "#;
 
 async fn health() -> Json<serde_json::Value> {
@@ -696,6 +811,381 @@ async fn done_task(
     get_task_by_id(state.pool(), id).await.map(Json)
 }
 
+async fn list_models(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ModelRecord>>, ApiError> {
+    authorize(&state, &headers)?;
+    let rows = sqlx::query(
+        "SELECT id, name, runtime_source, tier, context_window, pricing_input, pricing_output FROM models ORDER BY runtime_source, name",
+    )
+    .fetch_all(state.pool())
+    .await?;
+    rows.into_iter()
+        .map(row_to_model)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn list_capability_scores(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<CapabilityScoreRecord>>, ApiError> {
+    authorize(&state, &headers)?;
+    let rows = sqlx::query("SELECT runtime_type, model_id, capability, success_count, failure_count FROM capability_scores ORDER BY capability, runtime_type, model_id")
+        .fetch_all(state.pool())
+        .await?;
+    rows.into_iter()
+        .map(row_to_capability_score)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn update_capability_score(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(req): Json<CapabilityScoreUpdateRequest>,
+) -> Result<Json<CapabilityScoreRecord>, ApiError> {
+    authorize(&state, &headers)?;
+    sqlx::query(
+        r#"
+        INSERT INTO capability_scores (runtime_type, model_id, capability, success_count, failure_count)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(runtime_type, model_id, capability) DO UPDATE SET
+            success_count = success_count + ?4,
+            failure_count = failure_count + ?5
+        "#,
+    )
+    .bind(req.runtime_type.to_string())
+    .bind(&req.model_id)
+    .bind(&req.capability)
+    .bind(if req.success { 1 } else { 0 })
+    .bind(if req.success { 0 } else { 1 })
+    .execute(state.pool())
+    .await?;
+    let row = sqlx::query("SELECT runtime_type, model_id, capability, success_count, failure_count FROM capability_scores WHERE runtime_type = ?1 AND model_id = ?2 AND capability = ?3")
+        .bind(req.runtime_type.to_string())
+        .bind(req.model_id)
+        .bind(req.capability)
+        .fetch_one(state.pool())
+        .await?;
+    row_to_capability_score(row).map(Json)
+}
+
+async fn create_pipeline(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(req): Json<PipelineCreateRequest>,
+) -> Result<(StatusCode, Json<PipelineRecord>), ApiError> {
+    authorize(&state, &headers)?;
+    let workflow: WorkflowConfig =
+        serde_yaml::from_str(&req.workflow_yaml).map_err(ApiError::bad_request)?;
+    let now = Utc::now();
+    let pipeline = PipelineRecord {
+        id: Uuid::new_v4(),
+        workflow_yaml: req.workflow_yaml,
+        status: if req.approve_assignments {
+            PipelineStatus::Pending
+        } else {
+            PipelineStatus::AwaitingApproval
+        },
+        profile: workflow.workflow.profile,
+        created_at: now,
+        completed_at: None,
+    };
+    sqlx::query("INSERT INTO pipelines (id, workflow_yaml, status, profile, created_at, completed_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL)")
+        .bind(pipeline.id.to_string())
+        .bind(&pipeline.workflow_yaml)
+        .bind(pipeline.status.to_string())
+        .bind(pipeline.profile.to_string())
+        .bind(pipeline.created_at.to_rfc3339())
+        .execute(state.pool())
+        .await?;
+
+    for (slot_name, slot) in workflow.workflow.slots {
+        let runtime_type = slot.preferred.first().map(|pref| pref.runtime);
+        let model_id = slot.preferred.first().and_then(|pref| pref.model.clone());
+        let role = if slot.role.trim().is_empty() {
+            slot_name
+        } else {
+            slot.role
+        };
+        sqlx::query("INSERT INTO slots (id, pipeline_id, role, runtime_type, model_id, agent_id, status, capabilities_json) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(pipeline.id.to_string())
+            .bind(role)
+            .bind(runtime_type.map(|runtime| runtime.to_string()))
+            .bind(model_id)
+            .bind(SlotStatus::Assigned.to_string())
+            .bind(serde_json::to_string(&slot.required_capabilities).unwrap_or_else(|_| "[]".to_string()))
+            .execute(state.pool())
+            .await?;
+    }
+    insert_pipeline_event(
+        state.pool(),
+        pipeline.id,
+        None,
+        "pipeline_created",
+        serde_json::json!({ "status": pipeline.status, "profile": pipeline.profile }),
+        None,
+        None,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(pipeline)))
+}
+
+async fn list_pipelines(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<PipelineRecord>>, ApiError> {
+    authorize(&state, &headers)?;
+    let rows = sqlx::query(
+        "SELECT id, workflow_yaml, status, profile, created_at, completed_at FROM pipelines ORDER BY created_at DESC",
+    )
+    .fetch_all(state.pool())
+    .await?;
+    rows.into_iter()
+        .map(row_to_pipeline)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn get_pipeline(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PipelineRecord>, ApiError> {
+    authorize(&state, &headers)?;
+    get_pipeline_by_id(state.pool(), id).await.map(Json)
+}
+
+async fn update_pipeline_status(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(req): Json<PipelineStatusUpdateRequest>,
+) -> Result<Json<PipelineRecord>, ApiError> {
+    authorize(&state, &headers)?;
+    let completed_at = if req.completed {
+        Some(Utc::now().to_rfc3339())
+    } else {
+        None
+    };
+    sqlx::query(
+        "UPDATE pipelines SET status = ?1, completed_at = CASE WHEN ?2 IS NULL THEN completed_at ELSE ?2 END WHERE id = ?3",
+    )
+    .bind(req.status.to_string())
+    .bind(completed_at)
+    .bind(id.to_string())
+    .execute(state.pool())
+    .await?;
+    insert_pipeline_event(
+        state.pool(),
+        id,
+        None,
+        "pipeline_status_updated",
+        serde_json::json!({ "status": req.status, "completed": req.completed }),
+        None,
+        None,
+    )
+    .await?;
+    get_pipeline_by_id(state.pool(), id).await.map(Json)
+}
+
+async fn list_pipeline_slots(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<RoleSlot>>, ApiError> {
+    authorize(&state, &headers)?;
+    let rows = sqlx::query("SELECT id, pipeline_id, role, runtime_type, model_id, agent_id, status, capabilities_json FROM slots WHERE pipeline_id = ?1 ORDER BY role")
+        .bind(id.to_string())
+        .fetch_all(state.pool())
+        .await?;
+    rows.into_iter()
+        .map(row_to_slot)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn update_pipeline_slot(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Path((id, role)): Path<(Uuid, String)>,
+    Json(req): Json<SlotUpdateRequest>,
+) -> Result<Json<RoleSlot>, ApiError> {
+    authorize(&state, &headers)?;
+    sqlx::query(
+        r#"
+        UPDATE slots
+        SET status = ?1,
+            runtime_type = CASE WHEN ?2 THEN NULL ELSE COALESCE(?3, runtime_type) END,
+            model_id = CASE WHEN ?2 THEN NULL ELSE COALESCE(?4, model_id) END,
+            agent_id = CASE WHEN ?2 THEN NULL ELSE COALESCE(?5, agent_id) END
+        WHERE pipeline_id = ?6 AND role = ?7
+        "#,
+    )
+    .bind(req.status.to_string())
+    .bind(req.clear_assignment)
+    .bind(req.runtime_type.map(|runtime| runtime.to_string()))
+    .bind(req.model_id)
+    .bind(req.agent_id)
+    .bind(id.to_string())
+    .bind(&role)
+    .execute(state.pool())
+    .await?;
+    insert_pipeline_event(
+        state.pool(),
+        id,
+        None,
+        "slot_status_changed",
+        serde_json::json!({ "role": role, "status": req.status }),
+        None,
+        None,
+    )
+    .await?;
+    get_slot_by_role(state.pool(), id, &role).await.map(Json)
+}
+
+async fn list_pipeline_events(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<PipelineEventRecord>>, ApiError> {
+    authorize(&state, &headers)?;
+    let rows = sqlx::query("SELECT id, pipeline_id, agent_id, event_type, payload, correlation_id, causation_id, created_at FROM pipeline_events WHERE pipeline_id = ?1 ORDER BY id ASC")
+        .bind(id.to_string())
+        .fetch_all(state.pool())
+        .await?;
+    rows.into_iter()
+        .map(row_to_pipeline_event)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn create_pipeline_event(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(mut req): Json<PipelineEventCreateRequest>,
+) -> Result<(StatusCode, Json<PipelineEventRecord>), ApiError> {
+    authorize(&state, &headers)?;
+    req.pipeline_id = id;
+    let event_id = insert_pipeline_event(
+        state.pool(),
+        req.pipeline_id,
+        req.agent_id,
+        &req.event_type,
+        req.payload,
+        req.correlation_id,
+        req.causation_id,
+    )
+    .await?;
+    let event = get_pipeline_event_by_id(state.pool(), event_id).await?;
+    Ok((StatusCode::CREATED, Json(event)))
+}
+
+async fn list_pipeline_artifacts(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<agent_protocol::ArtifactRecord>>, ApiError> {
+    authorize(&state, &headers)?;
+    let rows = sqlx::query("SELECT id, pipeline_id, stage_name, artifact_type, content, created_by, created_at FROM artifacts WHERE pipeline_id = ?1 ORDER BY created_at ASC")
+        .bind(id.to_string())
+        .fetch_all(state.pool())
+        .await?;
+    rows.into_iter()
+        .map(row_to_artifact)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn create_artifact(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(mut req): Json<ArtifactCreateRequest>,
+) -> Result<(StatusCode, Json<agent_protocol::ArtifactRecord>), ApiError> {
+    authorize(&state, &headers)?;
+    req.pipeline_id = id;
+    let artifact = agent_protocol::ArtifactRecord {
+        id: Uuid::new_v4(),
+        pipeline_id: req.pipeline_id,
+        stage_name: req.stage_name,
+        artifact_type: req.artifact_type,
+        content: req.content,
+        created_by: req.created_by,
+        created_at: Utc::now(),
+    };
+    sqlx::query("INSERT INTO artifacts (id, pipeline_id, stage_name, artifact_type, content, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+        .bind(artifact.id.to_string())
+        .bind(artifact.pipeline_id.to_string())
+        .bind(&artifact.stage_name)
+        .bind(&artifact.artifact_type)
+        .bind(&artifact.content)
+        .bind(&artifact.created_by)
+        .bind(artifact.created_at.to_rfc3339())
+        .execute(state.pool())
+        .await?;
+    insert_pipeline_event(
+        state.pool(),
+        artifact.pipeline_id,
+        Some(artifact.created_by.clone()),
+        "artifact_created",
+        serde_json::json!({ "artifact_id": artifact.id, "stage_name": artifact.stage_name, "artifact_type": artifact.artifact_type }),
+        None,
+        None,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(artifact)))
+}
+
+async fn get_working_context(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Path((pipeline_id, role)): Path<(Uuid, String)>,
+) -> Result<Json<WorkingContext>, ApiError> {
+    authorize(&state, &headers)?;
+    let row = sqlx::query("SELECT pipeline_id, role, summary, key_decisions, active_files, updated_at FROM working_context WHERE pipeline_id = ?1 AND role = ?2")
+        .bind(pipeline_id.to_string())
+        .bind(role)
+        .fetch_optional(state.pool())
+        .await?
+        .ok_or_else(|| ApiError::not_found("working context not found"))?;
+    row_to_working_context(row).map(Json)
+}
+
+async fn upsert_working_context(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Path((pipeline_id, role)): Path<(Uuid, String)>,
+    Json(req): Json<WorkingContextUpsertRequest>,
+) -> Result<Json<WorkingContext>, ApiError> {
+    authorize(&state, &headers)?;
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        INSERT INTO working_context (pipeline_id, role, summary, key_decisions, active_files, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(pipeline_id, role) DO UPDATE SET
+            summary = excluded.summary,
+            key_decisions = excluded.key_decisions,
+            active_files = excluded.active_files,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(pipeline_id.to_string())
+    .bind(&role)
+    .bind(req.summary)
+    .bind(req.key_decisions.to_string())
+    .bind(serde_json::to_string(&req.active_files).unwrap_or_else(|_| "[]".to_string()))
+    .bind(now.to_rfc3339())
+    .execute(state.pool())
+    .await?;
+    get_working_context(State(state), headers, Path((pipeline_id, role))).await
+}
+
 #[derive(Debug, Deserialize)]
 struct FileClaimQuery {
     path: Option<String>,
@@ -873,6 +1363,8 @@ async fn get_finding(
 #[derive(Debug, Deserialize)]
 struct StreamQuery {
     agent_id: String,
+    last_event_id: Option<Uuid>,
+    since: Option<String>,
 }
 
 async fn stream(
@@ -883,12 +1375,17 @@ async fn stream(
     authorize(&state, &headers)?;
     let mut rx = state.inner.events.subscribe();
     let agent_id = query.agent_id;
+    let replay = replay_messages(state.pool(), &agent_id, query.last_event_id, query.since).await?;
     let stream = async_stream::stream! {
+        for message in replay {
+            let data = serde_json::to_string(&message).unwrap_or_else(|_| "{}".to_string());
+            yield Ok(Event::default().event("message").id(message.id.to_string()).data(data));
+        }
         loop {
             match rx.recv().await {
                 Ok(message) if message.to_agent == agent_id => {
                     let data = serde_json::to_string(&message).unwrap_or_else(|_| "{}".to_string());
-                    yield Ok(Event::default().event("message").data(data));
+                    yield Ok(Event::default().event("message").id(message.id.to_string()).data(data));
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -903,6 +1400,39 @@ async fn stream(
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     ))
+}
+
+async fn replay_messages(
+    pool: &SqlitePool,
+    agent_id: &str,
+    last_event_id: Option<Uuid>,
+    since: Option<String>,
+) -> Result<Vec<MessageRecord>, ApiError> {
+    let since_time = if let Some(last_event_id) = last_event_id {
+        sqlx::query_scalar::<_, Option<String>>("SELECT created_at FROM messages WHERE id = ?1")
+            .bind(last_event_id.to_string())
+            .fetch_optional(pool)
+            .await?
+            .flatten()
+    } else {
+        since
+    };
+    let Some(since_time) = since_time else {
+        return Ok(Vec::new());
+    };
+    let rows = sqlx::query(
+        r#"
+        SELECT id, from_agent, to_agent, kind, subject, body, thread_id, reply_to, status, created_at, read_at
+        FROM messages
+        WHERE to_agent = ?1 AND created_at > ?2
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(agent_id)
+    .bind(since_time)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(row_to_message).collect()
 }
 
 async fn active_agents(pool: &SqlitePool) -> Result<Vec<AgentRecord>, ApiError> {
@@ -1050,6 +1580,65 @@ async fn get_task_by_id(pool: &SqlitePool, id: Uuid) -> Result<TaskRecord, ApiEr
         .await?
         .ok_or_else(|| ApiError::not_found("task not found"))?;
     row_to_task(row)
+}
+
+async fn get_pipeline_by_id(pool: &SqlitePool, id: Uuid) -> Result<PipelineRecord, ApiError> {
+    let row = sqlx::query(
+        "SELECT id, workflow_yaml, status, profile, created_at, completed_at FROM pipelines WHERE id = ?1",
+    )
+    .bind(id.to_string())
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("pipeline not found"))?;
+    row_to_pipeline(row)
+}
+
+async fn get_slot_by_role(
+    pool: &SqlitePool,
+    pipeline_id: Uuid,
+    role: &str,
+) -> Result<RoleSlot, ApiError> {
+    let row = sqlx::query("SELECT id, pipeline_id, role, runtime_type, model_id, agent_id, status, capabilities_json FROM slots WHERE pipeline_id = ?1 AND role = ?2")
+        .bind(pipeline_id.to_string())
+        .bind(role)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("slot not found"))?;
+    row_to_slot(row)
+}
+
+async fn insert_pipeline_event(
+    pool: &SqlitePool,
+    pipeline_id: Uuid,
+    agent_id: Option<String>,
+    event_type: &str,
+    payload: serde_json::Value,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
+) -> Result<i64, ApiError> {
+    let result = sqlx::query("INSERT INTO pipeline_events (pipeline_id, agent_id, event_type, payload, correlation_id, causation_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+        .bind(pipeline_id.to_string())
+        .bind(agent_id)
+        .bind(event_type)
+        .bind(payload.to_string())
+        .bind(correlation_id)
+        .bind(causation_id)
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await?;
+    Ok(result.last_insert_rowid())
+}
+
+async fn get_pipeline_event_by_id(
+    pool: &SqlitePool,
+    id: i64,
+) -> Result<PipelineEventRecord, ApiError> {
+    let row = sqlx::query("SELECT id, pipeline_id, agent_id, event_type, payload, correlation_id, causation_id, created_at FROM pipeline_events WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("pipeline event not found"))?;
+    row_to_pipeline_event(row)
 }
 
 async fn set_task_status(pool: &SqlitePool, id: Uuid, status: TaskStatus) -> Result<(), ApiError> {
@@ -1232,6 +1821,115 @@ fn row_to_finding(row: SqliteRow) -> Result<FindingRecord, ApiError> {
     })
 }
 
+fn row_to_model(row: SqliteRow) -> Result<ModelRecord, ApiError> {
+    let tier: String = row.try_get("tier")?;
+    Ok(ModelRecord {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        runtime_source: row.try_get("runtime_source")?,
+        tier: tier.parse::<ModelTier>().map_err(ApiError::bad_request)?,
+        context_window: row.try_get("context_window")?,
+        pricing: ModelPricing {
+            input: row.try_get("pricing_input")?,
+            output: row.try_get("pricing_output")?,
+        },
+    })
+}
+
+fn row_to_capability_score(row: SqliteRow) -> Result<CapabilityScoreRecord, ApiError> {
+    let runtime_type: String = row.try_get("runtime_type")?;
+    Ok(CapabilityScoreRecord {
+        runtime_type: runtime_type
+            .parse::<RuntimeType>()
+            .map_err(ApiError::bad_request)?,
+        model_id: row.try_get("model_id")?,
+        capability: row.try_get("capability")?,
+        success_count: row.try_get("success_count")?,
+        failure_count: row.try_get("failure_count")?,
+    })
+}
+
+fn row_to_pipeline(row: SqliteRow) -> Result<PipelineRecord, ApiError> {
+    let status: String = row.try_get("status")?;
+    let profile: String = row.try_get("profile")?;
+    Ok(PipelineRecord {
+        id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        workflow_yaml: row.try_get("workflow_yaml")?,
+        status: status
+            .parse::<PipelineStatus>()
+            .map_err(ApiError::bad_request)?,
+        profile: profile
+            .parse::<SchedulerProfile>()
+            .map_err(ApiError::bad_request)?,
+        created_at: parse_time(row.try_get::<String, _>("created_at")?)?,
+        completed_at: row
+            .try_get::<Option<String>, _>("completed_at")?
+            .map(parse_time)
+            .transpose()?,
+    })
+}
+
+fn row_to_slot(row: SqliteRow) -> Result<RoleSlot, ApiError> {
+    let runtime_type = row
+        .try_get::<Option<String>, _>("runtime_type")?
+        .map(|value| value.parse::<RuntimeType>().map_err(ApiError::bad_request))
+        .transpose()?;
+    let status: String = row.try_get("status")?;
+    let capabilities_json: String = row.try_get("capabilities_json")?;
+    Ok(RoleSlot {
+        id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        pipeline_id: parse_uuid(row.try_get::<String, _>("pipeline_id")?)?,
+        role: row.try_get("role")?,
+        runtime_type,
+        model_id: row.try_get("model_id")?,
+        agent_id: row.try_get("agent_id")?,
+        status: status
+            .parse::<SlotStatus>()
+            .map_err(ApiError::bad_request)?,
+        capabilities: serde_json::from_str(&capabilities_json).unwrap_or_default(),
+    })
+}
+
+fn row_to_pipeline_event(row: SqliteRow) -> Result<PipelineEventRecord, ApiError> {
+    let payload: String = row.try_get("payload")?;
+    Ok(PipelineEventRecord {
+        id: row.try_get("id")?,
+        pipeline_id: parse_uuid(row.try_get::<String, _>("pipeline_id")?)?,
+        agent_id: row.try_get("agent_id")?,
+        event_type: row.try_get("event_type")?,
+        payload: serde_json::from_str(&payload).unwrap_or_else(|_| serde_json::json!({})),
+        correlation_id: row.try_get("correlation_id")?,
+        causation_id: row.try_get("causation_id")?,
+        created_at: parse_time(row.try_get::<String, _>("created_at")?)?,
+    })
+}
+
+fn row_to_artifact(row: SqliteRow) -> Result<agent_protocol::ArtifactRecord, ApiError> {
+    Ok(agent_protocol::ArtifactRecord {
+        id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        pipeline_id: parse_uuid(row.try_get::<String, _>("pipeline_id")?)?,
+        stage_name: row.try_get("stage_name")?,
+        artifact_type: row.try_get("artifact_type")?,
+        content: row.try_get("content")?,
+        created_by: row.try_get("created_by")?,
+        created_at: parse_time(row.try_get::<String, _>("created_at")?)?,
+    })
+}
+
+fn row_to_working_context(row: SqliteRow) -> Result<WorkingContext, ApiError> {
+    let key_decisions: String = row.try_get("key_decisions")?;
+    let active_files: String = row.try_get("active_files")?;
+    Ok(WorkingContext {
+        pipeline_id: parse_uuid(row.try_get::<String, _>("pipeline_id")?)?,
+        role: row.try_get("role")?,
+        summary: row.try_get("summary")?,
+        key_decisions: serde_json::from_str(&key_decisions)
+            .unwrap_or_else(|_| serde_json::json!({})),
+        active_files: serde_json::from_str(&active_files).unwrap_or_default(),
+        updated_at: parse_time(row.try_get::<String, _>("updated_at")?)?,
+    })
+}
+
 fn parse_uuid(value: String) -> Result<Uuid, ApiError> {
     Uuid::parse_str(&value).map_err(|err| ApiError::bad_request(err.to_string()))
 }
@@ -1254,6 +1952,32 @@ fn authorize(state: &HubState, headers: &HeaderMap) -> Result<(), ApiError> {
     };
     if token != state.inner.token {
         return Err(ApiError::unauthorized("invalid bearer token"));
+    }
+    check_rate_limit(state, token)?;
+    Ok(())
+}
+
+fn check_rate_limit(state: &HubState, token: &str) -> Result<(), ApiError> {
+    const WINDOW: Duration = Duration::from_secs(60);
+    const MAX_REQUESTS: u32 = 600;
+
+    let now = Instant::now();
+    let mut limits = state
+        .inner
+        .rate_limits
+        .lock()
+        .map_err(|_| ApiError::too_many_requests("rate limiter unavailable"))?;
+    let bucket = limits.entry(token.to_string()).or_insert(RateBucket {
+        window_started: now,
+        count: 0,
+    });
+    if now.duration_since(bucket.window_started) >= WINDOW {
+        bucket.window_started = now;
+        bucket.count = 0;
+    }
+    bucket.count += 1;
+    if bucket.count > MAX_REQUESTS {
+        return Err(ApiError::too_many_requests("rate limit exceeded"));
     }
     Ok(())
 }
@@ -1285,6 +2009,13 @@ impl ApiError {
             message: message.to_string(),
         }
     }
+
+    fn too_many_requests(message: impl ToString) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.to_string(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -1312,8 +2043,9 @@ impl From<sqlx::Error> for ApiError {
 mod tests {
     use super::*;
     use agent_protocol::{
-        Confidence, FileClaimRequest, FindingCreateRequest, FindingKind, HeartbeatRequest,
-        TaskCreateRequest, ThreadStatus,
+        ArtifactCreateRequest, Confidence, FileClaimRequest, FindingCreateRequest, FindingKind,
+        HeartbeatRequest, PipelineCreateRequest, PipelineEventCreateRequest,
+        PipelineStatusUpdateRequest, SlotUpdateRequest, TaskCreateRequest, ThreadStatus,
     };
     use axum::{
         body::{to_bytes, Body},
@@ -1330,6 +2062,16 @@ mod tests {
             .unwrap();
         init_db(&pool).await.unwrap();
         app(HubState::new(pool, "secret".to_string()))
+    }
+
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        init_db(&pool).await.unwrap();
+        pool
     }
 
     fn request(
@@ -1583,5 +2325,200 @@ mod tests {
         )
         .await;
         assert_eq!(findings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pipeline_models_slots_events_and_memory_work() {
+        let app = test_app().await;
+        let models: Vec<ModelRecord> =
+            decode(app.clone().oneshot(get("/api/models")).await.unwrap()).await;
+        assert!(!models.is_empty());
+
+        let workflow_yaml = r#"
+workflow:
+  id: quick-fix
+  name: Quick Fix
+  profile: quality-first
+  slots:
+    architect:
+      role: architect
+      preferred:
+        - runtime: claude-code
+          model: claude-code/default
+      required_capabilities: [architecture]
+  steps:
+    - architect.plan
+"#;
+        let response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/pipelines",
+                PipelineCreateRequest {
+                    workflow_yaml: workflow_yaml.to_string(),
+                    approve_assignments: true,
+                },
+                "secret",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let pipeline: PipelineRecord = decode(response).await;
+
+        let slots: Vec<RoleSlot> = decode(
+            app.clone()
+                .oneshot(get(&format!("/api/pipelines/{}/slots", pipeline.id)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(slots.len(), 1);
+
+        let slot_response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                &format!("/api/pipelines/{}/slots/architect", pipeline.id),
+                SlotUpdateRequest {
+                    status: SlotStatus::Working,
+                    runtime_type: None,
+                    model_id: None,
+                    agent_id: Some("architect-agent".to_string()),
+                    clear_assignment: false,
+                },
+                "secret",
+            ))
+            .await
+            .unwrap();
+        let updated_slot: RoleSlot = decode(slot_response).await;
+        assert_eq!(updated_slot.status, SlotStatus::Working);
+        assert_eq!(updated_slot.agent_id.as_deref(), Some("architect-agent"));
+
+        let events: Vec<PipelineEventRecord> = decode(
+            app.clone()
+                .oneshot(get(&format!("/api/pipelines/{}/events", pipeline.id)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(events.len(), 2);
+
+        let status_response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                &format!("/api/pipelines/{}/status", pipeline.id),
+                PipelineStatusUpdateRequest {
+                    status: PipelineStatus::Running,
+                    completed: false,
+                },
+                "secret",
+            ))
+            .await
+            .unwrap();
+        let updated: PipelineRecord = decode(status_response).await;
+        assert_eq!(updated.status, PipelineStatus::Running);
+
+        let event_response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                &format!("/api/pipelines/{}/events", pipeline.id),
+                PipelineEventCreateRequest {
+                    pipeline_id: pipeline.id,
+                    agent_id: Some("architect".to_string()),
+                    event_type: "step_completed".to_string(),
+                    payload: serde_json::json!({ "step": "architect.plan" }),
+                    correlation_id: None,
+                    causation_id: None,
+                },
+                "secret",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(event_response.status(), StatusCode::CREATED);
+
+        let artifact_response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                &format!("/api/pipelines/{}/artifacts", pipeline.id),
+                ArtifactCreateRequest {
+                    pipeline_id: pipeline.id,
+                    stage_name: "architect.plan".to_string(),
+                    artifact_type: "runtime_output".to_string(),
+                    content: "ok".to_string(),
+                    created_by: "architect".to_string(),
+                },
+                "secret",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(artifact_response.status(), StatusCode::CREATED);
+
+        let artifacts: Vec<agent_protocol::ArtifactRecord> = decode(
+            app.clone()
+                .oneshot(get(&format!("/api/pipelines/{}/artifacts", pipeline.id)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(artifacts.len(), 1);
+
+        let memory_response = app
+            .clone()
+            .oneshot(request(
+                Method::PUT,
+                &format!("/api/memory/{}/architect", pipeline.id),
+                WorkingContextUpsertRequest {
+                    summary: "handoff".to_string(),
+                    key_decisions: serde_json::json!(["use existing hub"]),
+                    active_files: vec!["crates/agent-hub/src/lib.rs".to_string()],
+                },
+                "secret",
+            ))
+            .await
+            .unwrap();
+        let memory: WorkingContext = decode(memory_response).await;
+        assert_eq!(memory.summary, "handoff");
+    }
+
+    #[tokio::test]
+    async fn stream_replay_uses_last_event_id() {
+        let pool = test_pool().await;
+        let first = insert_message(
+            &pool,
+            MessageCreateRequest {
+                from: "frontend".to_string(),
+                to: "backend".to_string(),
+                kind: MessageKind::StatusUpdate,
+                subject: "first".to_string(),
+                body: "one".to_string(),
+                thread_id: None,
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap();
+        let second = insert_message(
+            &pool,
+            MessageCreateRequest {
+                from: "frontend".to_string(),
+                to: "backend".to_string(),
+                kind: MessageKind::StatusUpdate,
+                subject: "second".to_string(),
+                body: "two".to_string(),
+                thread_id: None,
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let replay = replay_messages(&pool, "backend", Some(first.id), None)
+            .await
+            .unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].id, second.id);
     }
 }

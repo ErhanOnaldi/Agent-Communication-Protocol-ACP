@@ -1,0 +1,12 @@
+[package]
+name = "acp-runtime"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+acp-protocol = { path = "../acp-protocol" }
+anyhow.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

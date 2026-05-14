@@ -1,0 +1,23 @@
+workflow:
+  id: quick-fix
+  name: "Quick Fix"
+  profile: speed-first
+  slots:
+    implementer:
+      role: implementer
+      runtime_mode: auto
+      preferred:
+        - runtime: codex
+          model: codex/default
+        - runtime: claude-code
+          model: claude-code/default
+      required_capabilities: [coding]
+      optional: false
+  steps:
+    - implementer.implement
+  failure:
+    default: retry(1)
+  timeouts:
+    step_minutes: 20
+    pipeline_minutes: 45
+

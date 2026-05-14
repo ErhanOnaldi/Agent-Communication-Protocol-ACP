@@ -1,0 +1,25 @@
+[package]
+name = "acp-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+acp-discover = { path = "../acp-discover" }
+acp-orchestrator = { path = "../acp-orchestrator" }
+acp-protocol = { path = "../acp-protocol" }
+acp-workspace = { path = "../acp-workspace" }
+agent-client = { path = "../agent-client" }
+anyhow.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[[bin]]
+name = "acp"
+path = "src/main.rs"

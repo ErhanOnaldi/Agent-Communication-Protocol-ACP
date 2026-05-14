@@ -194,6 +194,392 @@ string_enum!(Confidence {
     High => "high",
 });
 
+string_enum!(RuntimeType {
+    ClaudeCode => "claude_code",
+    Codex => "codex",
+    Gemini => "gemini",
+    Copilot => "copilot",
+    Claudex => "claudex",
+});
+
+string_enum!(RuntimeHealth {
+    Healthy => "healthy",
+    Degraded => "degraded",
+    RateLimited => "rate_limited",
+    AuthExpired => "auth_expired",
+    Crashed => "crashed",
+    Missing => "missing",
+});
+
+string_enum!(SlotStatus {
+    Empty => "empty",
+    Assigned => "assigned",
+    Active => "active",
+    Working => "working",
+    Waiting => "waiting",
+    Vacant => "vacant",
+    Disabled => "disabled",
+});
+
+string_enum!(SchedulerProfile {
+    QualityFirst => "quality_first",
+    BudgetFirst => "budget_first",
+    SpeedFirst => "speed_first",
+});
+
+string_enum!(PipelineStatus {
+    Pending => "pending",
+    AwaitingApproval => "awaiting_approval",
+    Running => "running",
+    Succeeded => "succeeded",
+    Failed => "failed",
+    Cancelled => "cancelled",
+});
+
+string_enum!(ModelTier {
+    Free => "free",
+    Cheap => "cheap",
+    Standard => "standard",
+    Premium => "premium",
+    Local => "local",
+    Unknown => "unknown",
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPricing {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelRecord {
+    pub id: String,
+    pub name: String,
+    pub runtime_source: String,
+    pub tier: ModelTier,
+    pub context_window: Option<i64>,
+    pub pricing: ModelPricing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    pub name: String,
+    pub base_url: String,
+    pub api_key_env: String,
+    #[serde(default)]
+    pub models: Vec<ModelRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeRecord {
+    pub runtime_type: RuntimeType,
+    pub name: String,
+    pub binary: String,
+    pub path: Option<String>,
+    pub version: Option<String>,
+    pub health: RuntimeHealth,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePreference {
+    #[serde(deserialize_with = "deserialize_runtime_type")]
+    pub runtime: RuntimeType,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowSlot {
+    pub role: String,
+    #[serde(default)]
+    pub runtime_mode: Option<String>,
+    #[serde(default)]
+    pub preferred: Vec<RuntimePreference>,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    #[serde(default)]
+    pub optional: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WorkflowStep {
+    Action(String),
+    Parallel { parallel: Vec<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowFailurePolicy {
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub overrides: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowTimeouts {
+    pub step_minutes: Option<u64>,
+    pub pipeline_minutes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowDefinition {
+    pub id: String,
+    pub name: String,
+    #[serde(
+        default = "default_scheduler_profile",
+        deserialize_with = "deserialize_scheduler_profile"
+    )]
+    pub profile: SchedulerProfile,
+    #[serde(default)]
+    pub slots: std::collections::BTreeMap<String, WorkflowSlot>,
+    #[serde(default)]
+    pub steps: Vec<WorkflowStep>,
+    #[serde(default)]
+    pub failure: Option<WorkflowFailurePolicy>,
+    #[serde(default)]
+    pub timeouts: Option<WorkflowTimeouts>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowConfig {
+    pub workflow: WorkflowDefinition,
+}
+
+fn default_scheduler_profile() -> SchedulerProfile {
+    SchedulerProfile::QualityFirst
+}
+
+fn deserialize_runtime_type<'de, D>(deserializer: D) -> Result<RuntimeType, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    value
+        .replace('-', "_")
+        .parse()
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_scheduler_profile<'de, D>(deserializer: D) -> Result<SchedulerProfile, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    value
+        .replace('-', "_")
+        .parse()
+        .map_err(serde::de::Error::custom)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineCreateRequest {
+    pub workflow_yaml: String,
+    #[serde(default)]
+    pub approve_assignments: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineStatusUpdateRequest {
+    pub status: PipelineStatus,
+    #[serde(default)]
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineRecord {
+    pub id: Uuid,
+    pub workflow_yaml: String,
+    pub status: PipelineStatus,
+    pub profile: SchedulerProfile,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleSlot {
+    pub id: Uuid,
+    pub pipeline_id: Uuid,
+    pub role: String,
+    pub runtime_type: Option<RuntimeType>,
+    pub model_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub status: SlotStatus,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlotUpdateRequest {
+    pub status: SlotStatus,
+    pub runtime_type: Option<RuntimeType>,
+    pub model_id: Option<String>,
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub clear_assignment: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineEventRecord {
+    pub id: i64,
+    pub pipeline_id: Uuid,
+    pub agent_id: Option<String>,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PipelineEvent {
+    RuntimeSpawned {
+        runtime_type: RuntimeType,
+        model_id: Option<String>,
+    },
+    TaskAssigned {
+        role: String,
+        step: String,
+    },
+    PatchApplied {
+        files: Vec<String>,
+    },
+    RateLimitHit {
+        role: String,
+        runtime_type: RuntimeType,
+    },
+    AuthExpired {
+        role: String,
+        runtime_type: RuntimeType,
+    },
+    RuntimeCrash {
+        role: String,
+        runtime_type: RuntimeType,
+        message: String,
+    },
+    MergeConflict {
+        branch: String,
+        files: Vec<String>,
+    },
+    ToolFailure {
+        tool: String,
+        message: String,
+    },
+    ContextOverflow {
+        role: String,
+    },
+    ValidationFailure {
+        command: Vec<String>,
+        stderr: String,
+    },
+    SlotLifecycle {
+        role: String,
+        status: SlotStatus,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineEventCreateRequest {
+    pub pipeline_id: Uuid,
+    pub agent_id: Option<String>,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactCreateRequest {
+    pub pipeline_id: Uuid,
+    pub stage_name: String,
+    pub artifact_type: String,
+    pub content: String,
+    pub created_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactRecord {
+    pub id: Uuid,
+    pub pipeline_id: Uuid,
+    pub stage_name: String,
+    pub artifact_type: String,
+    pub content: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkingContext {
+    pub pipeline_id: Uuid,
+    pub role: String,
+    pub summary: String,
+    #[serde(default)]
+    pub key_decisions: serde_json::Value,
+    #[serde(default)]
+    pub active_files: Vec<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkingContextUpsertRequest {
+    pub summary: String,
+    #[serde(default)]
+    pub key_decisions: serde_json::Value,
+    #[serde(default)]
+    pub active_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSpec {
+    pub agent_id: String,
+    pub role: String,
+    pub runtime_type: RuntimeType,
+    pub model: Option<String>,
+    pub task: String,
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeOutput {
+    pub status: RuntimeHealth,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    #[serde(default)]
+    pub stream_events: Vec<RuntimeStreamEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeStreamEvent {
+    pub event_type: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityScoreRecord {
+    pub runtime_type: RuntimeType,
+    pub model_id: String,
+    pub capability: String,
+    pub success_count: i64,
+    pub failure_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityScoreUpdateRequest {
+    pub runtime_type: RuntimeType,
+    pub model_id: String,
+    pub capability: String,
+    #[serde(default)]
+    pub success: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
     pub agent_id: String,
@@ -408,5 +794,29 @@ mod tests {
             MessageKind::Custom("custom:handover_note".to_string())
         );
         assert!("handover_note".parse::<MessageKind>().is_err());
+    }
+
+    #[test]
+    fn workflow_yaml_accepts_plan_values() {
+        let yaml = r#"
+workflow:
+  id: quick-fix
+  name: Quick Fix
+  profile: quality-first
+  slots:
+    architect:
+      role: architect
+      preferred:
+        - runtime: claude-code
+          model: claude-code/default
+  steps:
+    - architect.plan
+"#;
+        let workflow: WorkflowConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(workflow.workflow.profile, SchedulerProfile::QualityFirst);
+        assert_eq!(
+            workflow.workflow.slots["architect"].preferred[0].runtime,
+            RuntimeType::ClaudeCode
+        );
     }
 }
