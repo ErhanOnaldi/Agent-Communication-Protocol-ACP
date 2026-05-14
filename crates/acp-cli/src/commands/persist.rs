@@ -1,0 +1,132 @@
+use acp_orchestrator::OrchestratorEvent;
+use acp_protocol::{
+    ArtifactCreateRequest, CapabilityScoreUpdateRequest, PipelineEventCreateRequest, RuntimeHealth,
+    SlotUpdateRequest, WorkingContextUpsertRequest,
+};
+use agent_client::AgentClient;
+use uuid::Uuid;
+
+pub async fn persist_orchestrator_event(
+    client: &AgentClient,
+    pipeline_id: Uuid,
+    event: OrchestratorEvent,
+) -> anyhow::Result<()> {
+    match event {
+        OrchestratorEvent::Slot(event) => {
+            client
+                .update_pipeline_slot(
+                    pipeline_id,
+                    &event.role,
+                    &SlotUpdateRequest {
+                        status: event.status,
+                        runtime_type: event.runtime_type,
+                        model_id: event.model_id.clone(),
+                        agent_id: None,
+                        clear_assignment: false,
+                    },
+                )
+                .await?;
+            client
+                .create_pipeline_event(
+                    pipeline_id,
+                    &PipelineEventCreateRequest {
+                        pipeline_id,
+                        agent_id: Some(event.role.clone()),
+                        event_type: "slot_lifecycle".to_string(),
+                        payload: serde_json::json!({
+                            "role": event.role,
+                            "status": event.status,
+                            "reason": event.reason,
+                        }),
+                        correlation_id: None,
+                        causation_id: None,
+                    },
+                )
+                .await?;
+        }
+        OrchestratorEvent::Step(result) => {
+            let model_id = result
+                .model_id
+                .clone()
+                .unwrap_or_else(|| format!("{}/default", result.runtime_type));
+            client
+                .update_capability_score(&CapabilityScoreUpdateRequest {
+                    runtime_type: result.runtime_type,
+                    model_id,
+                    capability: result.role.clone(),
+                    success: result.health == RuntimeHealth::Healthy,
+                })
+                .await?;
+            client
+                .create_pipeline_event(
+                    pipeline_id,
+                    &PipelineEventCreateRequest {
+                        pipeline_id,
+                        agent_id: Some(result.role.clone()),
+                        event_type: "step_completed".to_string(),
+                        payload: serde_json::json!({
+                            "step": result.step,
+                            "health": result.health,
+                            "runtime_type": result.runtime_type,
+                            "model_id": result.model_id,
+                        }),
+                        correlation_id: None,
+                        causation_id: None,
+                    },
+                )
+                .await?;
+            client
+                .create_artifact(
+                    pipeline_id,
+                    &ArtifactCreateRequest {
+                        pipeline_id,
+                        stage_name: result.step.clone(),
+                        artifact_type: "runtime_output".to_string(),
+                        content: format!(
+                            "stdout:\n{}\n\nstderr:\n{}",
+                            result.stdout, result.stderr
+                        ),
+                        created_by: result.role.clone(),
+                    },
+                )
+                .await?;
+        }
+        OrchestratorEvent::Handoff { role, context } => {
+            client
+                .upsert_working_context(
+                    pipeline_id,
+                    &role,
+                    &WorkingContextUpsertRequest {
+                        summary: context.summary,
+                        key_decisions: serde_json::json!(context.key_decisions),
+                        active_files: context.active_files,
+                    },
+                )
+                .await?;
+        }
+        OrchestratorEvent::MergeConflict {
+            role,
+            branch,
+            details,
+        } => {
+            client
+                .create_pipeline_event(
+                    pipeline_id,
+                    &PipelineEventCreateRequest {
+                        pipeline_id,
+                        agent_id: Some(role.clone()),
+                        event_type: "merge_conflict".to_string(),
+                        payload: serde_json::json!({
+                            "role": role,
+                            "branch": branch,
+                            "details": details,
+                        }),
+                        correlation_id: None,
+                        causation_id: None,
+                    },
+                )
+                .await?;
+        }
+    }
+    Ok(())
+}
