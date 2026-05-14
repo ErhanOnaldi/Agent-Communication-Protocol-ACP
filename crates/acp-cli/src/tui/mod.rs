@@ -34,36 +34,62 @@ pub async fn run_live_dashboard(hub_client: AgentClient) -> anyhow::Result<()> {
             interval.tick().await;
             let pipelines = client_bg.pipelines().await.unwrap_or_default();
             let models = client_bg.models().await.unwrap_or_default();
-            let (events, metrics) = if let Some(p) = pipelines.first() {
-                let evts: Vec<String> = client_bg
-                    .pipeline_events(p.id)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .rev()
-                    .take(10)
-                    .map(|e| {
-                        format!(
-                            "{} — {}",
-                            e.event_type,
-                            e.agent_id.as_deref().unwrap_or("-")
-                        )
-                    })
-                    .collect();
-                let mets = client_bg
-                    .pipeline_analytics(p.id)
-                    .await
-                    .map(|a| a.steps)
-                    .unwrap_or_default();
-                (evts, mets)
-            } else {
-                (Vec::new(), Vec::new())
+            let (events, metrics, scheduler, compressions, semantic_memory) =
+                if let Some(p) = pipelines.first() {
+                    let evts: Vec<String> = client_bg
+                        .pipeline_events(p.id)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .rev()
+                        .take(10)
+                        .map(|e| {
+                            format!(
+                                "{} — {}",
+                                e.event_type,
+                                e.agent_id.as_deref().unwrap_or("-")
+                            )
+                        })
+                        .collect();
+                    let mets = client_bg
+                        .pipeline_analytics(p.id)
+                        .await
+                        .map(|a| a.steps)
+                        .unwrap_or_default();
+                    let scheduler = client_bg
+                        .scheduler_decisions(p.id)
+                        .await
+                        .unwrap_or_default();
+                    let compressions = client_bg
+                        .context_compressions(p.id)
+                        .await
+                        .unwrap_or_default();
+                    let semantic_memory = client_bg.semantic_memory(p.id).await.unwrap_or_default();
+                    (evts, mets, scheduler, compressions, semantic_memory)
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                };
+            let mcp_health = match client_bg.mcp_servers().await {
+                Ok(servers) => {
+                    let mut health = Vec::new();
+                    for server in servers {
+                        if let Ok(record) = client_bg.mcp_health(&server.name).await {
+                            health.push(record);
+                        }
+                    }
+                    health
+                }
+                Err(_) => Vec::new(),
             };
             let mut s = state_bg.lock().unwrap();
             s.pipelines = pipelines;
             s.models = models;
             s.events = events;
             s.metrics = metrics;
+            s.scheduler = scheduler;
+            s.compressions = compressions;
+            s.semantic_memory = semantic_memory;
+            s.mcp_health = mcp_health;
             if s.quit {
                 break;
             }
@@ -76,12 +102,9 @@ pub async fn run_live_dashboard(hub_client: AgentClient) -> anyhow::Result<()> {
             if s.quit {
                 break;
             }
-            let pipelines = s.pipelines.clone();
-            let models = s.models.clone();
-            let events = s.events.clone();
-            let metrics = s.metrics.clone();
+            let snapshot = s.clone();
             drop(s);
-            terminal.draw(|frame| draw_dashboard(frame, &pipelines, &models, &events, &metrics))?;
+            terminal.draw(|frame| draw_dashboard(frame, &snapshot))?;
         }
 
         if event::poll(Duration::from_millis(200))? {

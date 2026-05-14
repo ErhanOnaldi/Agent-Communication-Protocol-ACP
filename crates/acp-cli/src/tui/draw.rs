@@ -1,4 +1,4 @@
-use acp_protocol::{ModelRecord, PipelineRecord, PipelineStatus, RuntimeHealth, StepMetricsRecord};
+use acp_protocol::{PipelineStatus, RuntimeHealth};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -7,13 +7,9 @@ use ratatui::{
     Frame,
 };
 
-pub fn draw_dashboard(
-    frame: &mut Frame,
-    pipelines: &[PipelineRecord],
-    models: &[ModelRecord],
-    events: &[String],
-    metrics: &[StepMetricsRecord],
-) {
+use super::state::DashboardState;
+
+pub fn draw_dashboard(frame: &mut Frame, state: &DashboardState) {
     let area = frame.area();
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -21,14 +17,15 @@ pub fn draw_dashboard(
             Constraint::Length(3),
             Constraint::Min(8),
             Constraint::Length(5),
+            Constraint::Length(8),
             Constraint::Length(6),
         ])
         .split(area);
 
     let header = Paragraph::new(format!(
         " ACP Dashboard  |  models: {}  |  pipelines: {}  |  [r] refresh  [q] quit",
-        models.len(),
-        pipelines.len(),
+        state.models.len(),
+        state.pipelines.len(),
     ))
     .style(
         Style::default()
@@ -43,7 +40,8 @@ pub fn draw_dashboard(
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(vertical[1]);
 
-    let pipeline_items: Vec<ListItem> = pipelines
+    let pipeline_items: Vec<ListItem> = state
+        .pipelines
         .iter()
         .take(20)
         .map(|p| {
@@ -66,11 +64,12 @@ pub fn draw_dashboard(
             ]))
         })
         .collect();
-    let pipeline_list = List::new(pipeline_items)
-        .block(Block::default().title("Pipelines").borders(Borders::ALL));
+    let pipeline_list =
+        List::new(pipeline_items).block(Block::default().title("Pipelines").borders(Borders::ALL));
     frame.render_widget(pipeline_list, horizontal[0]);
 
-    let model_items: Vec<ListItem> = models
+    let model_items: Vec<ListItem> = state
+        .models
         .iter()
         .take(20)
         .map(|m| {
@@ -87,7 +86,8 @@ pub fn draw_dashboard(
         List::new(model_items).block(Block::default().title("Models").borders(Borders::ALL));
     frame.render_widget(model_list, horizontal[1]);
 
-    let recent: Vec<ListItem> = events
+    let recent: Vec<ListItem> = state
+        .events
         .iter()
         .rev()
         .take(3)
@@ -102,8 +102,92 @@ pub fn draw_dashboard(
         .style(Style::default().fg(Color::Gray));
     frame.render_widget(log, vertical[2]);
 
+    let advanced = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(vertical[3]);
+
+    let scheduler_items: Vec<ListItem> = state
+        .scheduler
+        .iter()
+        .rev()
+        .take(5)
+        .map(|d| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<12}", truncate(&d.role, 11)),
+                    Style::default().fg(Color::White),
+                ),
+                Span::raw(format!(" {} {:.2}", d.runtime_type, d.final_score)),
+            ]))
+        })
+        .collect();
+    frame.render_widget(
+        List::new(scheduler_items).block(Block::default().title("Scheduler").borders(Borders::ALL)),
+        advanced[0],
+    );
+
+    let memory_items: Vec<ListItem> = state
+        .compressions
+        .iter()
+        .rev()
+        .take(3)
+        .map(|c| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<12}", truncate(&c.role, 11)),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(format!(
+                    " {} refs:{}",
+                    truncate(&c.compressor, 16),
+                    c.semantic_refs.len()
+                )),
+            ]))
+        })
+        .chain(state.semantic_memory.iter().rev().take(2).map(|m| {
+            ListItem::new(Line::from(vec![
+                Span::styled("mem ", Style::default().fg(Color::DarkGray)),
+                Span::raw(truncate(&m.item_id, 28).to_string()),
+            ]))
+        }))
+        .collect();
+    frame.render_widget(
+        List::new(memory_items).block(Block::default().title("Memory").borders(Borders::ALL)),
+        advanced[1],
+    );
+
+    let mcp_items: Vec<ListItem> = state
+        .mcp_health
+        .iter()
+        .take(5)
+        .map(|h| {
+            let color = if h.status == RuntimeHealth::Healthy {
+                Color::Green
+            } else {
+                Color::Yellow
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<14}", truncate(&h.name, 13)),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(h.status.to_string(), Style::default().fg(color)),
+            ]))
+        })
+        .collect();
+    frame.render_widget(
+        List::new(mcp_items).block(Block::default().title("MCP").borders(Borders::ALL)),
+        advanced[2],
+    );
+
     // Analytics panel: last N step metrics
-    let metric_items: Vec<ListItem> = metrics
+    let metric_items: Vec<ListItem> = state
+        .metrics
         .iter()
         .rev()
         .take(4)
@@ -137,7 +221,7 @@ pub fn draw_dashboard(
                 .borders(Borders::ALL),
         )
         .style(Style::default().fg(Color::Gray));
-    frame.render_widget(metrics_list, vertical[3]);
+    frame.render_widget(metrics_list, vertical[4]);
 }
 
 fn truncate(s: &str, max: usize) -> &str {

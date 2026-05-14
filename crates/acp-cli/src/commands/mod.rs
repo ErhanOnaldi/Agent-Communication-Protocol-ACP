@@ -1,7 +1,10 @@
 pub mod analytics;
 pub mod discover;
+pub mod mcp;
+pub mod memory;
 pub mod persist;
 pub mod pipeline;
+pub mod runtime;
 pub mod skill;
 pub mod slot;
 pub mod workspace;

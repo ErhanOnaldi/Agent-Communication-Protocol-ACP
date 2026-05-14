@@ -28,8 +28,11 @@ version = "0.1.0"
 dependencies = [
  "acp-protocol",
  "anyhow",
+ "chrono",
  "serde",
+ "serde_json",
  "serde_yaml",
+ "tempfile",
  "tokio",
 ]
 
@@ -37,13 +40,23 @@ dependencies = [
 name = "acp-hub"
 version = "0.1.0"
 dependencies = [
- "agent-hub",
+ "acp-protocol",
  "anyhow",
+ "async-stream",
  "axum",
+ "chrono",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "serde_yaml",
  "sqlx",
+ "tempfile",
  "tokio",
+ "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -66,7 +79,11 @@ dependencies = [
 name = "acp-protocol"
 version = "0.1.0"
 dependencies = [
- "agent-protocol",
+ "chrono",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "uuid",
 ]
 
 [[package]]
@@ -76,9 +93,12 @@ dependencies = [
  "acp-protocol",
  "anyhow",
  "async-trait",
+ "chrono",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -111,34 +131,20 @@ dependencies = [
 name = "agent-hub"
 version = "0.1.0"
 dependencies = [
- "agent-protocol",
+ "acp-hub",
  "anyhow",
- "async-stream",
  "axum",
- "chrono",
- "futures-util",
- "serde",
- "serde_json",
- "serde_yaml",
  "sqlx",
- "tempfile",
  "tokio",
- "tower",
- "tower-http",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
 name = "agent-protocol"
 version = "0.1.0"
 dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "serde_yaml",
- "uuid",
+ "acp-protocol",
 ]
 
 [[package]]

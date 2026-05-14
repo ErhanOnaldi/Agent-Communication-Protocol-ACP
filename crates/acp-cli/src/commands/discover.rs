@@ -1,4 +1,4 @@
-use acp_discover::{DiscoveryConfig, load_providers, provider_statuses};
+use acp_discover::{load_providers, provider_statuses, DiscoveryConfig};
 use acp_protocol::ProviderConfig;
 
 use crate::client::print_yaml;
@@ -34,6 +34,8 @@ pub async fn handle_provider(
                 base_url: args.base_url,
                 api_key_env: args.api_key_env,
                 models: Vec::new(),
+                embedding_model: None,
+                embedding_base_url: None,
             };
             let path = dir.join(format!("{}.yaml", args.name));
             std::fs::write(&path, serde_yaml::to_string(&provider)?)?;
@@ -70,6 +72,15 @@ pub async fn handle_doctor(config: &DiscoveryConfig) -> anyhow::Result<()> {
         );
     }
     println!("Models: {}", report.models.len());
+    println!("MCP:");
+    for server in report.mcp {
+        println!(
+            "- {}: {} ({})",
+            server.name,
+            server.status,
+            server.message.unwrap_or_else(|| "configured".to_string())
+        );
+    }
     Ok(())
 }
 

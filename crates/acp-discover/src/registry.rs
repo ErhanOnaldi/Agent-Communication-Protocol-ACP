@@ -1,4 +1,6 @@
-use acp_protocol::{ModelPricing, ModelRecord, ModelTier, ProviderConfig, RuntimeHealth, RuntimeRecord, RuntimeType};
+use acp_protocol::{
+    ModelPricing, ModelRecord, ModelTier, ProviderConfig, RuntimeHealth, RuntimeRecord, RuntimeType,
+};
 
 pub fn build_model_registry(
     runtimes: &[RuntimeRecord],

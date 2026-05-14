@@ -12,13 +12,53 @@ pub enum AnalyticsCommand {
         /// Pipeline UUID
         id: Uuid,
     },
+    Scheduler {
+        /// Pipeline UUID
+        id: Uuid,
+    },
 }
 
 pub async fn handle_analytics(command: AnalyticsCommand, cli: &Cli) -> anyhow::Result<()> {
     let client = crate::client::client(cli)?;
     match command {
         AnalyticsCommand::Pipeline { id } => print_pipeline_analytics(&client, id, cli.json).await,
+        AnalyticsCommand::Scheduler { id } => {
+            print_scheduler_analytics(&client, id, cli.json).await
+        }
     }
+}
+
+async fn print_scheduler_analytics(
+    client: &AgentClient,
+    id: Uuid,
+    json: bool,
+) -> anyhow::Result<()> {
+    let decisions = client.scheduler_decisions(id).await?;
+    if json {
+        print_yaml(json, &decisions)?;
+        return Ok(());
+    }
+    println!("Scheduler decisions for {id}");
+    if decisions.is_empty() {
+        println!("No scheduler decisions recorded yet.");
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:<14} {:<28} {:<8} REASON",
+        "ROLE", "RUNTIME", "MODEL", "SCORE"
+    );
+    println!("{}", "─".repeat(96));
+    for decision in decisions {
+        println!(
+            "{:<20} {:<14} {:<28} {:<8.3} {}",
+            truncate(&decision.role, 19),
+            decision.runtime_type,
+            truncate(decision.model_id.as_deref().unwrap_or("default"), 27),
+            decision.final_score,
+            decision.reason
+        );
+    }
+    Ok(())
 }
 
 async fn print_pipeline_analytics(
@@ -54,7 +94,10 @@ async fn print_pipeline_analytics(
         return Ok(());
     }
 
-    println!("{:<30} {:<20} {:<14} {:<12} LATENCY", "STEP", "ROLE", "RUNTIME", "HEALTH");
+    println!(
+        "{:<30} {:<20} {:<14} {:<12} LATENCY",
+        "STEP", "ROLE", "RUNTIME", "HEALTH"
+    );
     println!("{}", "─".repeat(90));
 
     for step in &analytics.steps {

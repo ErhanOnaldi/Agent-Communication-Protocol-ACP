@@ -3,8 +3,7 @@ use std::path::PathBuf;
 use acp_discover::{load_skills, DiscoveryConfig};
 use acp_orchestrator::{parse_workflow, run_local_pipeline_with_events};
 use acp_protocol::{
-    PipelineCreateRequest, PipelineEventCreateRequest, PipelineStatus,
-    PipelineStatusUpdateRequest,
+    PipelineCreateRequest, PipelineEventCreateRequest, PipelineStatus, PipelineStatusUpdateRequest,
 };
 use anyhow::Context;
 use uuid::Uuid;

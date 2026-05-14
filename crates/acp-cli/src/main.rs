@@ -10,7 +10,10 @@ mod tui;
 use commands::{
     analytics::{handle_analytics, AnalyticsCommand},
     discover::{handle_doctor, handle_models, handle_provider, ProviderCommand},
+    mcp::{handle_mcp, McpCommand},
+    memory::{handle_memory, MemoryCommand},
     pipeline::{handle_pipeline, PipelineCommand},
+    runtime::{handle_runtime, RuntimeCommand},
     skill::{handle_skill, SkillCommand},
     slot::{handle_slot, SlotCommand},
     workspace::handle_workspace_status,
@@ -59,6 +62,18 @@ enum Command {
         #[command(subcommand)]
         command: AnalyticsCommand,
     },
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommand,
+    },
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
     Workspace {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
@@ -85,6 +100,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Slot { command } => handle_slot(command, &cli).await?,
         Command::Skill { command } => handle_skill(command, &config, cli.json).await?,
         Command::Analytics { command } => handle_analytics(command, &cli).await?,
+        Command::Mcp { command } => handle_mcp(command, &config, &cli).await?,
+        Command::Runtime { command } => handle_runtime(command, &cli).await?,
+        Command::Memory { command } => handle_memory(command, &cli).await?,
         Command::Workspace { repo } => handle_workspace_status(repo).await?,
         Command::Doctor => handle_doctor(&config).await?,
         Command::Dashboard => {

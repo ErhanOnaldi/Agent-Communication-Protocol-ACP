@@ -2,14 +2,16 @@ use std::time::Duration;
 
 use agent_protocol::{
     AgentRecord, ArtifactCreateRequest, ArtifactRecord, BroadcastRequest, CapabilityScoreRecord,
-    CapabilityScoreUpdateRequest, FileClaimRecord, FileClaimRequest, FileClaimResponse,
-    FindingCreateRequest, FindingRecord, HeartbeatRequest, MessageCreateRequest, MessageKind,
-    MessageRecord, MessageStatus, ModelRecord, PipelineAnalyticsResponse, PipelineCreateRequest,
+    CapabilityScoreUpdateRequest, ContextCompressionCreateRequest, ContextCompressionRecord,
+    FileClaimRecord, FileClaimRequest, FileClaimResponse, FindingCreateRequest, FindingRecord,
+    HeartbeatRequest, McpHealth, McpServerRecord, MessageCreateRequest, MessageKind, MessageRecord,
+    MessageStatus, ModelRecord, PipelineAnalyticsResponse, PipelineCreateRequest,
     PipelineEventCreateRequest, PipelineEventRecord, PipelineRecord, PipelineStatusUpdateRequest,
-    ReplyRequest, RoleMessageRequest, RoleSlot, SlotUpdateRequest, StepMetricCreateRequest,
-    StepMetricsRecord, TaskClaimRequest, TaskCreateRequest, TaskRecord, TaskStatusRequest,
-    ThreadDetail, ThreadRecord, UpdateAgentStatusRequest, WorkingContext,
-    WorkingContextUpsertRequest,
+    ReplyRequest, RoleMessageRequest, RoleSlot, RuntimeCommandResponse, SchedulerDecision,
+    SchedulerDecisionCreateRequest, SemanticMemoryCreateRequest, SemanticMemoryRecord,
+    SemanticSearchResponse, SlotUpdateRequest, StepMetricCreateRequest, StepMetricsRecord,
+    TaskClaimRequest, TaskCreateRequest, TaskRecord, TaskStatusRequest, ThreadDetail, ThreadRecord,
+    UpdateAgentStatusRequest, WorkingContext, WorkingContextUpsertRequest,
 };
 use anyhow::{bail, Context};
 use futures_util::StreamExt;
@@ -206,7 +208,17 @@ impl AgentClient {
     }
 
     pub async fn pipeline_events(&self, id: Uuid) -> anyhow::Result<Vec<PipelineEventRecord>> {
-        self.get(&format!("/api/pipelines/{id}/events")).await
+        self.pipeline_events_after(id, None).await
+    }
+
+    pub async fn pipeline_events_after(
+        &self,
+        id: Uuid,
+        after: Option<i64>,
+    ) -> anyhow::Result<Vec<PipelineEventRecord>> {
+        let suffix = after.map(|v| format!("?after={v}")).unwrap_or_default();
+        self.get(&format!("/api/pipelines/{id}/events{suffix}"))
+            .await
     }
 
     pub async fn create_pipeline_event(
@@ -239,10 +251,96 @@ impl AgentClient {
             .await
     }
 
-    pub async fn pipeline_analytics(
+    pub async fn scheduler_decisions(&self, id: Uuid) -> anyhow::Result<Vec<SchedulerDecision>> {
+        self.get(&format!("/api/pipelines/{id}/scheduler-decisions"))
+            .await
+    }
+
+    pub async fn create_scheduler_decision(
         &self,
         id: Uuid,
-    ) -> anyhow::Result<PipelineAnalyticsResponse> {
+        req: &SchedulerDecisionCreateRequest,
+    ) -> anyhow::Result<SchedulerDecision> {
+        self.post(&format!("/api/pipelines/{id}/scheduler-decisions"), req)
+            .await
+    }
+
+    pub async fn context_compressions(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Vec<ContextCompressionRecord>> {
+        self.get(&format!("/api/pipelines/{id}/context-compressions"))
+            .await
+    }
+
+    pub async fn create_context_compression(
+        &self,
+        id: Uuid,
+        req: &ContextCompressionCreateRequest,
+    ) -> anyhow::Result<ContextCompressionRecord> {
+        self.post(&format!("/api/pipelines/{id}/context-compressions"), req)
+            .await
+    }
+
+    pub async fn semantic_memory(&self, id: Uuid) -> anyhow::Result<Vec<SemanticMemoryRecord>> {
+        self.get(&format!("/api/pipelines/{id}/semantic-memory"))
+            .await
+    }
+
+    pub async fn create_semantic_memory(
+        &self,
+        id: Uuid,
+        req: &SemanticMemoryCreateRequest,
+    ) -> anyhow::Result<SemanticMemoryRecord> {
+        self.post(&format!("/api/pipelines/{id}/semantic-memory"), req)
+            .await
+    }
+
+    pub async fn memory_search(
+        &self,
+        id: Uuid,
+        query: &str,
+    ) -> anyhow::Result<SemanticSearchResponse> {
+        let query = query.replace(' ', "+");
+        self.get(&format!("/api/pipelines/{id}/memory-search?q={query}"))
+            .await
+    }
+
+    pub async fn mcp_servers(&self) -> anyhow::Result<Vec<McpServerRecord>> {
+        self.get("/api/mcp").await
+    }
+
+    pub async fn upsert_mcp_server(
+        &self,
+        req: &McpServerRecord,
+    ) -> anyhow::Result<McpServerRecord> {
+        self.post("/api/mcp", req).await
+    }
+
+    pub async fn mcp_health(&self, name: &str) -> anyhow::Result<McpHealth> {
+        self.get(&format!("/api/mcp/{name}/health")).await
+    }
+
+    pub async fn interrupt_runtime(
+        &self,
+        agent_id: &str,
+    ) -> anyhow::Result<RuntimeCommandResponse> {
+        self.post(
+            &format!("/api/runtime/{agent_id}/interrupt"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn shutdown_runtime(&self, agent_id: &str) -> anyhow::Result<RuntimeCommandResponse> {
+        self.post(
+            &format!("/api/runtime/{agent_id}/shutdown"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn pipeline_analytics(&self, id: Uuid) -> anyhow::Result<PipelineAnalyticsResponse> {
         self.get(&format!("/api/analytics/pipelines/{id}")).await
     }
 

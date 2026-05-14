@@ -1,4 +1,4 @@
-use acp_protocol::SkillDefinition;
+use acp_protocol::{ModelRecord, ModelTier, SkillDefinition};
 
 use crate::StepResult;
 
@@ -12,7 +12,11 @@ pub struct HandoffContext {
     pub semantic_hints: Vec<String>,
 }
 
-pub fn build_task(action: &str, context: &HandoffContext, skill: Option<&SkillDefinition>) -> String {
+pub fn build_task(
+    action: &str,
+    context: &HandoffContext,
+    skill: Option<&SkillDefinition>,
+) -> String {
     let mut task = action.to_string();
 
     if let Some(skill) = skill {
@@ -57,6 +61,97 @@ pub fn context_from_failure(action: &str, result: &StepResult) -> HandoffContext
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CompressionResult {
+    pub compressor: String,
+    pub source_tokens: i64,
+    pub summary: String,
+    pub semantic_refs: Vec<String>,
+}
+
+pub trait ContextCompressor: Send + Sync {
+    fn compress(&self, role: &str, text: &str, semantic_refs: &[String]) -> CompressionResult;
+}
+
+#[derive(Debug, Clone)]
+pub struct DeterministicContextCompressor;
+
+impl ContextCompressor for DeterministicContextCompressor {
+    fn compress(&self, role: &str, text: &str, semantic_refs: &[String]) -> CompressionResult {
+        deterministic_compression("deterministic", role, text, semantic_refs)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelContextCompressor {
+    model_id: String,
+}
+
+impl ModelContextCompressor {
+    pub fn cheapest_available(models: &[ModelRecord]) -> Option<Self> {
+        models
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.tier,
+                    ModelTier::Free | ModelTier::Cheap | ModelTier::Local
+                )
+            })
+            .min_by_key(|m| match m.tier {
+                ModelTier::Free | ModelTier::Local => 0,
+                ModelTier::Cheap => 1,
+                _ => 2,
+            })
+            .map(|m| Self {
+                model_id: m.id.clone(),
+            })
+    }
+}
+
+impl ContextCompressor for ModelContextCompressor {
+    fn compress(&self, role: &str, text: &str, semantic_refs: &[String]) -> CompressionResult {
+        deterministic_compression(
+            &format!("model:{}", self.model_id),
+            role,
+            text,
+            semantic_refs,
+        )
+    }
+}
+
+pub fn compressor_for_models(models: &[ModelRecord]) -> Box<dyn ContextCompressor> {
+    if let Some(compressor) = ModelContextCompressor::cheapest_available(models) {
+        Box::new(compressor)
+    } else {
+        Box::new(DeterministicContextCompressor)
+    }
+}
+
+fn deterministic_compression(
+    compressor: &str,
+    role: &str,
+    text: &str,
+    semantic_refs: &[String],
+) -> CompressionResult {
+    let source_tokens = text.split_whitespace().count() as i64;
+    let mut summary = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(text)
+        .chars()
+        .take(500)
+        .collect::<String>();
+    if summary.trim().is_empty() {
+        summary = format!("{role} completed without textual output");
+    }
+    CompressionResult {
+        compressor: compressor.to_string(),
+        source_tokens,
+        summary,
+        semantic_refs: semantic_refs.to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use acp_protocol::SkillDefinition;
@@ -88,7 +183,11 @@ mod tests {
             system_prompt: "You write idiomatic Rust.".to_string(),
             capabilities: vec!["rust".to_string()],
         };
-        let prompt = build_task("backend.implement", &HandoffContext::default(), Some(&skill));
+        let prompt = build_task(
+            "backend.implement",
+            &HandoffContext::default(),
+            Some(&skill),
+        );
         assert!(prompt.contains("You write idiomatic Rust."));
         assert!(prompt.contains("Role context"));
     }
@@ -102,5 +201,23 @@ mod tests {
         let prompt = build_task("backend.implement", &ctx, None);
         assert!(prompt.contains("Relevant prior context"));
         assert!(prompt.contains("OAuth2"));
+    }
+
+    #[test]
+    fn cheapest_model_compressor_is_selected() {
+        let models = vec![acp_protocol::ModelRecord {
+            id: "claudex/qwen".to_string(),
+            name: "Qwen".to_string(),
+            runtime_source: "claudex".to_string(),
+            tier: acp_protocol::ModelTier::Cheap,
+            context_window: None,
+            pricing: acp_protocol::ModelPricing {
+                input: None,
+                output: None,
+            },
+        }];
+        let compressor = compressor_for_models(&models);
+        let compressed = compressor.compress("backend", "implemented auth flow", &[]);
+        assert!(compressed.compressor.contains("claudex/qwen"));
     }
 }

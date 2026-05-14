@@ -1,12 +1,14 @@
 use std::{env, path::PathBuf};
 
 pub mod health;
+pub mod mcp;
 pub mod provider;
 pub mod registry;
 pub mod skills;
 pub mod subscription;
 
 pub use health::{doctor, DoctorReport};
+pub use mcp::{load_mcp_config, McpConfig, McpLaunch, McpManager, McpServerConfig, McpServerMode};
 pub use provider::{load_providers, provider_statuses, ProviderStatus};
 pub use registry::build_model_registry;
 pub use skills::load_skills;

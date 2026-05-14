@@ -274,7 +274,12 @@ mod tests {
             required_capabilities: vec!["rust".to_string()],
             optional: false,
         };
-        let base = scheduler.score(&slot, RuntimeType::Codex, None, SchedulerProfile::QualityFirst);
+        let base = scheduler.score(
+            &slot,
+            RuntimeType::Codex,
+            None,
+            SchedulerProfile::QualityFirst,
+        );
         let with_model = scheduler.score(
             &slot,
             RuntimeType::Codex,
@@ -292,7 +297,10 @@ mod tests {
             runtime_source: "codex".to_string(),
             tier: ModelTier::Premium,
             context_window: None,
-            pricing: ModelPricing { input: None, output: None },
+            pricing: ModelPricing {
+                input: None,
+                output: None,
+            },
         };
         let old_date = chrono::Utc::now() - chrono::Duration::days(30);
         let recent_date = chrono::Utc::now() - chrono::Duration::days(1);
@@ -311,17 +319,26 @@ mod tests {
             required_capabilities: vec!["rust".to_string()],
             optional: false,
         };
-        let sched_old = Scheduler::new(vec![model.clone()])
-            .with_scores(vec![make_score(Some(old_date))]);
-        let sched_recent = Scheduler::new(vec![model.clone()])
-            .with_scores(vec![make_score(Some(recent_date))]);
+        let sched_old =
+            Scheduler::new(vec![model.clone()]).with_scores(vec![make_score(Some(old_date))]);
+        let sched_recent =
+            Scheduler::new(vec![model.clone()]).with_scores(vec![make_score(Some(recent_date))]);
         let score_old = sched_old.score(
-            &slot, RuntimeType::Codex, sched_old.models.first(), SchedulerProfile::QualityFirst,
+            &slot,
+            RuntimeType::Codex,
+            sched_old.models.first(),
+            SchedulerProfile::QualityFirst,
         );
         let score_recent = sched_recent.score(
-            &slot, RuntimeType::Codex, sched_recent.models.first(), SchedulerProfile::QualityFirst,
+            &slot,
+            RuntimeType::Codex,
+            sched_recent.models.first(),
+            SchedulerProfile::QualityFirst,
         );
-        assert!(score_recent > score_old, "recent score {score_recent} should exceed old {score_old}");
+        assert!(
+            score_recent > score_old,
+            "recent score {score_recent} should exceed old {score_old}"
+        );
     }
 
     #[test]
@@ -333,7 +350,10 @@ mod tests {
             runtime_source: "codex".to_string(),
             tier: ModelTier::Premium,
             context_window: None,
-            pricing: ModelPricing { input: None, output: None },
+            pricing: ModelPricing {
+                input: None,
+                output: None,
+            },
         };
         let scheduler = Scheduler::new(vec![model]);
         let slot = WorkflowSlot {

@@ -1,8 +1,10 @@
 pub mod adapter;
+pub mod manager;
 pub mod output;
 
 pub use adapter::claudex::ClaudexProvider;
 pub use adapter::{ProcessRuntimeAdapter, RuntimeAdapter};
+pub use manager::RuntimeManager;
 pub use output::{classify_output, parse_stream_json_events};
 
 use acp_protocol::RuntimeType;

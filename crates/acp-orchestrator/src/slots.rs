@@ -3,10 +3,7 @@ use std::sync::Arc;
 use acp_protocol::SlotStatus;
 use tokio::sync::{mpsc::UnboundedSender, Mutex};
 
-use crate::{
-    scheduler::Assignment,
-    OrchestratorEvent, StepResult,
-};
+use crate::{scheduler::Assignment, OrchestratorEvent, StepResult};
 
 #[derive(Debug, Clone)]
 pub struct SlotLifecycleEvent {

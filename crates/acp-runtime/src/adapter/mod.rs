@@ -2,7 +2,9 @@ pub mod claudex;
 
 use std::time::Duration;
 
-use acp_protocol::{AgentSpec, RuntimeHealth, RuntimeOutput, RuntimeType};
+use acp_protocol::{
+    AgentSpec, RuntimeHealth, RuntimeOutput, RuntimeStreamEvent, RuntimeType, TaskHandle,
+};
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use tokio::{process::Command, time::timeout};
@@ -15,7 +17,25 @@ use crate::output::{classify_output, parse_stream_json_events};
 #[async_trait]
 pub trait RuntimeAdapter: Send + Sync {
     async fn spawn(&self, spec: AgentSpec) -> anyhow::Result<RuntimeOutput>;
+    async fn send_task(&self, _spec: AgentSpec) -> anyhow::Result<TaskHandle> {
+        anyhow::bail!("runtime adapter does not support persistent send_task")
+    }
     async fn health(&self) -> RuntimeHealth;
+
+    async fn stream_events(
+        &self,
+        output: &RuntimeOutput,
+    ) -> anyhow::Result<Vec<RuntimeStreamEvent>> {
+        Ok(output.stream_events.clone())
+    }
+
+    async fn interrupt(&self, _agent_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown(&self, _agent_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +115,9 @@ impl ProcessRuntimeAdapter {
         }
         for (key, value) in &spec.env {
             command.env(key, value);
+        }
+        if !spec.mcp_servers.is_empty() {
+            command.env("ACP_MCP_SERVERS", serde_json::to_string(&spec.mcp_servers)?);
         }
         Ok(command)
     }

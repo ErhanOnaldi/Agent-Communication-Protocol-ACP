@@ -16,7 +16,7 @@ pub use slots::SlotLifecycleEvent;
 
 use std::collections::BTreeMap;
 
-use acp_protocol::{RuntimeHealth, RuntimeType};
+use acp_protocol::{RuntimeHealth, RuntimeType, SchedulerInsights};
 
 #[derive(Debug, Clone)]
 pub struct PipelineRunReport {
@@ -59,5 +59,24 @@ pub enum OrchestratorEvent {
         role: String,
         branch: String,
         details: String,
+    },
+    SchedulerDecision {
+        role: String,
+        insights: SchedulerInsights,
+        reason: String,
+    },
+    ContextCompressed {
+        role: String,
+        compressor: String,
+        source_tokens: i64,
+        summary: String,
+        semantic_refs: Vec<String>,
+    },
+    SemanticMemory {
+        item_id: String,
+        content: String,
+        embedding_provider: String,
+        embedding_model: String,
+        embedding: Vec<f32>,
     },
 }

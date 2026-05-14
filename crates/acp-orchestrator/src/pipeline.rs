@@ -1,13 +1,13 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use acp_protocol::{
-    CapabilityScoreRecord, ModelRecord, RuntimeHealth, SkillDefinition, SlotStatus, WorkflowConfig,
-    WorkflowStep,
+    CapabilityScoreRecord, ModelRecord, RuntimeHealth, SchedulerProfile, SkillDefinition,
+    SlotStatus, WorkflowConfig, WorkflowStep,
 };
 use acp_workspace::WorkspaceEngine;
 use anyhow::{bail, Context};
 use tokio::{
-    sync::{mpsc::UnboundedSender, Mutex},
+    sync::{mpsc::UnboundedSender, Mutex, RwLock},
     task::JoinSet,
     time::{timeout, Instant},
 };
@@ -15,10 +15,12 @@ use tracing::instrument;
 
 use crate::{
     adaptive::AdaptiveController,
-    memory::HandoffContext,
-    recovery::{action_role, failure_action_for_role, find_skill, run_action_with_recovery, ActionCtx},
+    memory::{compressor_for_models, ContextCompressor, HandoffContext},
+    recovery::{
+        action_role, failure_action_for_role, find_skill, run_action_with_recovery, ActionCtx,
+    },
     scheduler::Scheduler,
-    semantic::MemoryIndex,
+    semantic::{EmbeddingProvider, HashedEmbeddingProvider, MemoryIndex},
     slots::{emit_slot, emit_step, SlotLifecycleEvent},
     OrchestratorEvent, PipelineRunReport,
 };
@@ -45,6 +47,8 @@ pub async fn run_local_pipeline_with_events(
     event_sink: Option<UnboundedSender<OrchestratorEvent>>,
 ) -> anyhow::Result<PipelineRunReport> {
     let config = parse_workflow(yaml)?;
+    let compressor = compressor_for_models(&models);
+    let embedding_provider = HashedEmbeddingProvider;
     let scheduler = Scheduler::new(models).with_scores(capability_scores);
     let workspace = WorkspaceEngine::new(repo_root);
     let step_timeout = config
@@ -66,11 +70,24 @@ pub async fn run_local_pipeline_with_events(
     let mut assignments = Vec::new();
     let mut slot_events = Vec::new();
     for (slot_name, slot) in &config.workflow.slots {
-        let candidates = scheduler.candidates(slot_name, slot, config.workflow.profile)?;
+        let candidates_with_insights =
+            scheduler.candidates_with_insights(slot_name, slot, config.workflow.profile)?;
+        let candidates: Vec<_> = candidates_with_insights
+            .iter()
+            .map(|(assignment, _)| assignment.clone())
+            .collect();
         let assignment = candidates
             .first()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no runtime candidates for role {slot_name}"))?;
+        if let Some((_, insights)) = candidates_with_insights.first() {
+            emit_scheduler_decision(
+                &event_sink,
+                slot_name.clone(),
+                insights.clone(),
+                "initial assignment".to_string(),
+            );
+        }
         let event = SlotLifecycleEvent {
             role: slot_name.clone(),
             status: SlotStatus::Assigned,
@@ -86,7 +103,7 @@ pub async fn run_local_pipeline_with_events(
         assignments.extend(candidates);
     }
 
-    let assignments = Arc::new(assignments);
+    let assignments = Arc::new(RwLock::new(assignments));
     let handoff_contexts: Arc<Mutex<BTreeMap<String, HandoffContext>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
     let slot_events = Arc::new(Mutex::new(slot_events));
@@ -94,7 +111,8 @@ pub async fn run_local_pipeline_with_events(
 
     // Phase 3: semantic memory index and adaptive profile controller.
     let mut memory = MemoryIndex::new();
-    let mut controller = AdaptiveController::new(config.workflow.profile);
+    let mut current_profile = config.workflow.profile;
+    let mut controller = AdaptiveController::new(current_profile);
     // Track last step health for conditional step evaluation.
     let mut last_health: Option<RuntimeHealth> = None;
 
@@ -130,10 +148,28 @@ pub async fn run_local_pipeline_with_events(
                 // Update semantic index with step output.
                 let snippet = result.stdout.chars().take(500).collect::<String>();
                 memory.add(&result.step, &snippet);
+                record_step_memory(
+                    &event_sink,
+                    compressor.as_ref(),
+                    &embedding_provider,
+                    &result.role,
+                    &result.step,
+                    &result.stdout,
+                    &result.stderr,
+                );
 
                 last_health = Some(result.health);
                 let updated_profile = controller.record_step(result.health);
-                if updated_profile != config.workflow.profile {
+                if updated_profile != current_profile {
+                    current_profile = updated_profile;
+                    refresh_assignments(
+                        &scheduler,
+                        &config,
+                        &assignments,
+                        current_profile,
+                        &event_sink,
+                    )
+                    .await?;
                     tracing::info!(profile = %updated_profile, "adaptive: profile updated mid-pipeline");
                 }
 
@@ -183,13 +219,36 @@ pub async fn run_local_pipeline_with_events(
                     let result = res.context("parallel workflow task panicked")??;
                     let snippet = result.stdout.chars().take(500).collect::<String>();
                     memory.add(&result.step, &snippet);
+                    record_step_memory(
+                        &event_sink,
+                        compressor.as_ref(),
+                        &embedding_provider,
+                        &result.role,
+                        &result.step,
+                        &result.stdout,
+                        &result.stderr,
+                    );
                     last_health = Some(result.health);
-                    controller.record_step(result.health);
+                    let updated_profile = controller.record_step(result.health);
+                    if updated_profile != current_profile {
+                        current_profile = updated_profile;
+                        refresh_assignments(
+                            &scheduler,
+                            &config,
+                            &assignments,
+                            current_profile,
+                            &event_sink,
+                        )
+                        .await?;
+                    }
                     emit_step(&event_sink, result.clone());
                     step_results.push(result);
                 }
             }
-            WorkflowStep::Conditional { action, when_healthy } => {
+            WorkflowStep::Conditional {
+                action,
+                when_healthy,
+            } => {
                 // Only run if the previous step health matches the condition.
                 if *when_healthy {
                     match last_health {
@@ -232,8 +291,28 @@ pub async fn run_local_pipeline_with_events(
 
                 let snippet = result.stdout.chars().take(500).collect::<String>();
                 memory.add(&result.step, &snippet);
+                record_step_memory(
+                    &event_sink,
+                    compressor.as_ref(),
+                    &embedding_provider,
+                    &result.role,
+                    &result.step,
+                    &result.stdout,
+                    &result.stderr,
+                );
                 last_health = Some(result.health);
-                controller.record_step(result.health);
+                let updated_profile = controller.record_step(result.health);
+                if updated_profile != current_profile {
+                    current_profile = updated_profile;
+                    refresh_assignments(
+                        &scheduler,
+                        &config,
+                        &assignments,
+                        current_profile,
+                        &event_sink,
+                    )
+                    .await?;
+                }
 
                 emit_step(&event_sink, result.clone());
                 step_results.push(result);
@@ -241,7 +320,7 @@ pub async fn run_local_pipeline_with_events(
         }
     }
 
-    let assignments = Arc::try_unwrap(assignments).unwrap_or_else(|a| (*a).clone());
+    let assignments = assignments.read().await.clone();
     let handoff_contexts = Arc::try_unwrap(handoff_contexts)
         .map_err(|_| anyhow::anyhow!("handoff context still shared"))?
         .into_inner();
@@ -269,6 +348,96 @@ async fn inject_semantic_context(
         let role = action_role(action);
         let mut ctx = handoff_contexts.lock().await;
         ctx.entry(role).or_default().semantic_hints = hints;
+    }
+}
+
+async fn refresh_assignments(
+    scheduler: &Scheduler,
+    config: &WorkflowConfig,
+    assignments: &Arc<RwLock<Vec<crate::scheduler::Assignment>>>,
+    profile: SchedulerProfile,
+    event_sink: &Option<UnboundedSender<OrchestratorEvent>>,
+) -> anyhow::Result<()> {
+    let mut refreshed = Vec::new();
+    for (slot_name, slot) in &config.workflow.slots {
+        let candidates_with_insights =
+            scheduler.candidates_with_insights(slot_name, slot, profile)?;
+        if let Some((primary, insights)) = candidates_with_insights.first() {
+            emit_scheduler_decision(
+                event_sink,
+                slot_name.clone(),
+                insights.clone(),
+                format!("adaptive reassignment using {profile} profile"),
+            );
+            emit_slot(
+                &mut Vec::new(),
+                event_sink,
+                SlotLifecycleEvent {
+                    role: slot_name.clone(),
+                    status: SlotStatus::Assigned,
+                    reason: format!(
+                        "adaptive reassigned {} {} using {} profile",
+                        primary.runtime_type,
+                        primary.model_id.as_deref().unwrap_or("default"),
+                        profile
+                    ),
+                    runtime_type: Some(primary.runtime_type),
+                    model_id: primary.model_id.clone(),
+                },
+            );
+        }
+        refreshed.extend(
+            candidates_with_insights
+                .into_iter()
+                .map(|(assignment, _)| assignment),
+        );
+    }
+    *assignments.write().await = refreshed;
+    Ok(())
+}
+
+fn emit_scheduler_decision(
+    event_sink: &Option<UnboundedSender<OrchestratorEvent>>,
+    role: String,
+    insights: acp_protocol::SchedulerInsights,
+    reason: String,
+) {
+    if let Some(sink) = event_sink {
+        let _ = sink.send(OrchestratorEvent::SchedulerDecision {
+            role,
+            insights,
+            reason,
+        });
+    }
+}
+
+fn record_step_memory(
+    event_sink: &Option<UnboundedSender<OrchestratorEvent>>,
+    compressor: &dyn ContextCompressor,
+    embedding_provider: &dyn EmbeddingProvider,
+    role: &str,
+    item_id: &str,
+    stdout: &str,
+    stderr: &str,
+) {
+    let content = format!("{stdout}\n{stderr}");
+    let semantic_refs = vec![item_id.to_string()];
+    let compressed = compressor.compress(role, &content, &semantic_refs);
+    if let Some(sink) = event_sink {
+        let _ = sink.send(OrchestratorEvent::ContextCompressed {
+            role: role.to_string(),
+            compressor: compressed.compressor,
+            source_tokens: compressed.source_tokens,
+            summary: compressed.summary,
+            semantic_refs: compressed.semantic_refs,
+        });
+        let _ = sink.send(OrchestratorEvent::SemanticMemory {
+            item_id: item_id.to_string(),
+            content,
+            embedding_provider: embedding_provider.provider_name().to_string(),
+            embedding_model: embedding_provider.model_name().to_string(),
+            embedding: embedding_provider.embed(stdout),
+        });
     }
 }
 
@@ -337,7 +506,10 @@ workflow:
         assert_eq!(workflow.workflow.steps.len(), 2);
         assert!(matches!(
             &workflow.workflow.steps[1],
-            WorkflowStep::Conditional { when_healthy: true, .. }
+            WorkflowStep::Conditional {
+                when_healthy: true,
+                ..
+            }
         ));
     }
 

@@ -18,9 +18,7 @@ impl ClaudexProvider {
         let config_dir = env::var_os("ACP_CLAUDEX_CONFIG_DIR")
             .map(PathBuf::from)
             .or_else(|| env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from))
-            .or_else(|| {
-                env::var_os("HOME").map(|home| PathBuf::from(home).join(".acp/claudex"))
-            })
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".acp/claudex")))
             .unwrap_or_else(|| PathBuf::from(".acp/claudex"));
         Self {
             base_url,

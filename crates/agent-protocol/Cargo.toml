@@ -5,11 +5,4 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
-chrono.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-uuid.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
-serde_yaml.workspace = true
+acp-protocol = { path = "../acp-protocol" }

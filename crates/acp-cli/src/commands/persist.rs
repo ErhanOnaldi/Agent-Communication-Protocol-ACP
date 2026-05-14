@@ -1,7 +1,9 @@
 use acp_orchestrator::OrchestratorEvent;
 use acp_protocol::{
-    ArtifactCreateRequest, CapabilityScoreUpdateRequest, PipelineEventCreateRequest, RuntimeHealth,
-    SlotUpdateRequest, StepMetricCreateRequest, WorkingContextUpsertRequest,
+    ArtifactCreateRequest, CapabilityScoreUpdateRequest, ContextCompressionCreateRequest,
+    PipelineEventCreateRequest, RuntimeHealth, SchedulerDecisionCreateRequest,
+    SemanticMemoryCreateRequest, SlotUpdateRequest, StepMetricCreateRequest,
+    WorkingContextUpsertRequest,
 };
 use agent_client::AgentClient;
 use uuid::Uuid;
@@ -55,6 +57,9 @@ pub async fn persist_orchestrator_event(
                     model_id,
                     capability: result.role.clone(),
                     success: result.health == RuntimeHealth::Healthy,
+                    latency_ms: Some(result.latency_ms),
+                    had_conflict: result.conflict.is_some(),
+                    retry_count: 0,
                 })
                 .await?;
             client
@@ -107,6 +112,8 @@ pub async fn persist_orchestrator_event(
                 .await?;
         }
         OrchestratorEvent::Handoff { role, context } => {
+            let summary = context.summary.clone();
+            let semantic_refs = context.semantic_hints.clone();
             client
                 .upsert_working_context(
                     pipeline_id,
@@ -115,6 +122,19 @@ pub async fn persist_orchestrator_event(
                         summary: context.summary,
                         key_decisions: serde_json::json!(context.key_decisions),
                         active_files: context.active_files,
+                    },
+                )
+                .await?;
+            client
+                .create_context_compression(
+                    pipeline_id,
+                    &ContextCompressionCreateRequest {
+                        pipeline_id,
+                        role,
+                        compressor: "handoff".to_string(),
+                        source_tokens: summary.split_whitespace().count() as i64,
+                        summary,
+                        semantic_refs,
                     },
                 )
                 .await?;
@@ -138,6 +158,70 @@ pub async fn persist_orchestrator_event(
                         }),
                         correlation_id: None,
                         causation_id: None,
+                    },
+                )
+                .await?;
+        }
+        OrchestratorEvent::SchedulerDecision {
+            role,
+            insights,
+            reason,
+        } => {
+            client
+                .create_scheduler_decision(
+                    pipeline_id,
+                    &SchedulerDecisionCreateRequest {
+                        pipeline_id,
+                        role,
+                        runtime_type: insights.runtime_type,
+                        model_id: insights.model_id,
+                        base_score: insights.base_score,
+                        learned_delta: insights.learned_delta,
+                        profile_boost: insights.profile_boost,
+                        final_score: insights.final_score,
+                        reason,
+                    },
+                )
+                .await?;
+        }
+        OrchestratorEvent::ContextCompressed {
+            role,
+            compressor,
+            source_tokens,
+            summary,
+            semantic_refs,
+        } => {
+            client
+                .create_context_compression(
+                    pipeline_id,
+                    &ContextCompressionCreateRequest {
+                        pipeline_id,
+                        role,
+                        compressor,
+                        source_tokens,
+                        summary,
+                        semantic_refs,
+                    },
+                )
+                .await?;
+        }
+        OrchestratorEvent::SemanticMemory {
+            item_id,
+            content,
+            embedding_provider,
+            embedding_model,
+            embedding,
+        } => {
+            client
+                .create_semantic_memory(
+                    pipeline_id,
+                    &SemanticMemoryCreateRequest {
+                        pipeline_id,
+                        item_id,
+                        content,
+                        embedding_provider,
+                        embedding_model,
+                        embedding,
                     },
                 )
                 .await?;

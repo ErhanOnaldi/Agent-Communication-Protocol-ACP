@@ -7,15 +7,15 @@ use acp_protocol::{
 use acp_runtime::{adapter_for, RuntimeAdapter};
 use acp_workspace::WorkspaceEngine;
 use anyhow::bail;
-use tokio::sync::{mpsc::UnboundedSender, Mutex};
+use tokio::sync::{mpsc::UnboundedSender, Mutex, RwLock};
 use tracing::instrument;
 
+use crate::scheduler::Assignment;
 use crate::{
     memory::{build_task, context_from_failure, HandoffContext},
     slots::{emit_conflict, fallback_assignment, push_slot, SlotLifecycleEvent},
-    OrchestratorEvent, StepResult, ConflictInfo,
+    ConflictInfo, OrchestratorEvent, StepResult,
 };
-use crate::scheduler::Assignment;
 
 #[derive(Debug, Clone, Copy)]
 pub enum FailureAction {
@@ -89,7 +89,7 @@ pub(crate) fn is_recoverable(health: RuntimeHealth) -> bool {
 }
 
 pub struct ActionCtx {
-    pub assignments: Arc<Vec<Assignment>>,
+    pub assignments: Arc<RwLock<Vec<Assignment>>>,
     pub workspace: WorkspaceEngine,
     pub handoff_contexts: Arc<Mutex<BTreeMap<String, HandoffContext>>>,
     pub slot_events: Arc<Mutex<Vec<SlotLifecycleEvent>>>,
@@ -99,10 +99,7 @@ pub struct ActionCtx {
 }
 
 #[instrument(skip(ctx), fields(action = %action))]
-pub async fn run_action_with_recovery(
-    action: &str,
-    ctx: ActionCtx,
-) -> anyhow::Result<StepResult> {
+pub async fn run_action_with_recovery(action: &str, ctx: ActionCtx) -> anyhow::Result<StepResult> {
     let ActionCtx {
         assignments,
         workspace,
@@ -211,7 +208,8 @@ pub async fn run_action_with_recovery(
         }
 
         if attempt + 1 < max_attempts {
-            match fallback_assignment(&assignments, &role, &result) {
+            let current_assignments = assignments.read().await.clone();
+            match fallback_assignment(&current_assignments, &role, &result) {
                 Ok(fb) => {
                     push_slot(
                         &slot_events,
@@ -274,10 +272,17 @@ pub async fn run_action_with_recovery(
     }
 }
 
-#[instrument(skip(assignments, workspace, context, override_assignment, skill, event_sink))]
+#[instrument(skip(
+    assignments,
+    workspace,
+    context,
+    override_assignment,
+    skill,
+    event_sink
+))]
 pub async fn run_action_with_context(
     action: &str,
-    assignments: &[Assignment],
+    assignments: &Arc<RwLock<Vec<Assignment>>>,
     workspace: &WorkspaceEngine,
     context: HandoffContext,
     override_assignment: Option<Assignment>,
@@ -285,8 +290,9 @@ pub async fn run_action_with_context(
     event_sink: &Option<UnboundedSender<OrchestratorEvent>>,
 ) -> anyhow::Result<StepResult> {
     let role = action_role(action);
+    let current_assignments = assignments.read().await;
     let assignment = override_assignment
-        .or_else(|| assignments.iter().find(|a| a.role == role).cloned())
+        .or_else(|| current_assignments.iter().find(|a| a.role == role).cloned())
         .ok_or_else(|| anyhow::anyhow!("no assignment for workflow step {action}"))?;
     let agent_workspace = workspace.create_agent_workspace(&role, None).await?;
     let adapter = adapter_for(assignment.runtime_type);
@@ -302,6 +308,7 @@ pub async fn run_action_with_context(
             workspace: Some(agent_workspace.path.display().to_string()),
             allowed_tools: Vec::new(),
             env: Default::default(),
+            mcp_servers: Vec::new(),
         })
         .await?;
     let latency_ms = t0.elapsed().as_millis() as u64;
@@ -315,10 +322,22 @@ pub async fn run_action_with_context(
                 agent_workspace.branch.clone(),
                 details.clone(),
             );
-            Some(ConflictInfo {
-                branch: agent_workspace.branch,
-                details,
-            })
+            match try_resolve_conflict(
+                workspace,
+                &assignment,
+                &role,
+                &agent_workspace.branch,
+                &details,
+                event_sink,
+            )
+            .await
+            {
+                Ok(true) => None,
+                _ => Some(ConflictInfo {
+                    branch: agent_workspace.branch,
+                    details,
+                }),
+            }
         }
         _ => None,
     };
@@ -334,6 +353,58 @@ pub async fn run_action_with_context(
         conflict,
         latency_ms,
     })
+}
+
+async fn try_resolve_conflict(
+    workspace: &WorkspaceEngine,
+    assignment: &Assignment,
+    role: &str,
+    conflicted_branch: &str,
+    details: &str,
+    event_sink: &Option<UnboundedSender<OrchestratorEvent>>,
+) -> anyhow::Result<bool> {
+    let resolver_workspace = workspace
+        .create_agent_workspace("conflict-resolver", None)
+        .await?;
+    let adapter = adapter_for(assignment.runtime_type);
+    let task = format!(
+        "Resolve merge conflict for role {role} from branch {conflicted_branch}.\n\
+         Preserve existing behavior, inspect conflict details, edit only necessary files, \
+         and leave the worktree ready for merge simulation.\n\nConflict details:\n{details}"
+    );
+    let output = adapter
+        .spawn(AgentSpec {
+            agent_id: resolver_workspace.agent_id.clone(),
+            role: "conflict-resolver".to_string(),
+            runtime_type: assignment.runtime_type,
+            model: assignment.model_id.clone(),
+            task,
+            workspace: Some(resolver_workspace.path.display().to_string()),
+            allowed_tools: Vec::new(),
+            env: Default::default(),
+            mcp_servers: Vec::new(),
+        })
+        .await?;
+    if output.status != RuntimeHealth::Healthy {
+        return Ok(false);
+    }
+    let sim = workspace
+        .simulate_merge(&resolver_workspace.branch)
+        .await
+        .unwrap_or(acp_workspace::MergeSimulation {
+            clean: false,
+            stdout: String::new(),
+            stderr: "resolver merge simulation failed".to_string(),
+        });
+    if !sim.clean {
+        emit_conflict(
+            event_sink,
+            "conflict-resolver".to_string(),
+            resolver_workspace.branch,
+            format!("{}\n{}", sim.stdout, sim.stderr),
+        );
+    }
+    Ok(sim.clean)
 }
 
 #[cfg(test)]

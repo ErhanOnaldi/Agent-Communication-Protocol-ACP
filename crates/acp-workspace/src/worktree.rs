@@ -27,7 +27,11 @@ impl WorkspaceEngine {
         let task_id = task_id
             .map(ToString::to_string)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let agent_id = format!("{}-{}", super::sanitize(role), &task_id[..task_id.len().min(8)]);
+        let agent_id = format!(
+            "{}-{}",
+            super::sanitize(role),
+            &task_id[..task_id.len().min(8)]
+        );
         let branch = format!(
             "acp/{}/{}",
             super::sanitize(role),
