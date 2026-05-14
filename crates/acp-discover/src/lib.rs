@@ -4,7 +4,8 @@ use std::{
 };
 
 use acp_protocol::{
-    ModelPricing, ModelRecord, ModelTier, ProviderConfig, RuntimeHealth, RuntimeRecord, RuntimeType,
+    ModelPricing, ModelRecord, ModelTier, ProviderConfig, RuntimeHealth, RuntimeRecord,
+    RuntimeType, SkillDefinition,
 };
 use anyhow::Context;
 use tokio::process::Command;
@@ -162,6 +163,30 @@ fn which(binary: &str) -> Option<PathBuf> {
     env::split_paths(&paths)
         .map(|path| path.join(binary))
         .find(|path| path.exists())
+}
+
+pub fn load_skills(config: &DiscoveryConfig) -> anyhow::Result<Vec<SkillDefinition>> {
+    let dir = config.acp_home.join("skills");
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut skills = Vec::new();
+    for entry in
+        std::fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read skill {}", path.display()))?;
+        let skill: SkillDefinition = serde_yaml::from_str(&text)
+            .with_context(|| format!("failed to parse skill {}", path.display()))?;
+        skills.push(skill);
+    }
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(skills)
 }
 
 async fn command_version(binary: &str) -> anyhow::Result<String> {

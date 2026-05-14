@@ -15,6 +15,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct AgentClient {
     base_url: String,
     token: String,

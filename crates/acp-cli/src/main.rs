@@ -1,6 +1,11 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs, io,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use acp_discover::{doctor, load_providers, provider_statuses, DiscoveryConfig};
+use acp_discover::{doctor, load_providers, load_skills, provider_statuses, DiscoveryConfig};
 use acp_orchestrator::{parse_workflow, run_local_pipeline_with_events, OrchestratorEvent};
 use acp_protocol::{
     ArtifactCreateRequest, CapabilityScoreUpdateRequest, PipelineCreateRequest,
@@ -11,6 +16,19 @@ use acp_workspace::WorkspaceEngine;
 use agent_client::AgentClient;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
+use crossterm::{
+    event::{self, Event, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+    Terminal,
+};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -47,6 +65,10 @@ enum Command {
     Slot {
         #[command(subcommand)]
         command: SlotCommand,
+    },
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
     },
     Workspace {
         #[command(subcommand)]
@@ -108,6 +130,12 @@ enum SlotCommand {
 }
 
 #[derive(Debug, Clone, Subcommand)]
+enum SkillCommand {
+    List,
+    Show { name: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
 enum WorkspaceCommand {
     Status {
         #[arg(long, default_value = ".")]
@@ -137,8 +165,9 @@ async fn main() -> anyhow::Result<()> {
             print_yaml(cli.json, &models)?;
         }
         Command::Provider { command } => handle_provider(command, &config, cli.json).await?,
-        Command::Pipeline { command } => handle_pipeline(command, &cli).await?,
+        Command::Pipeline { command } => handle_pipeline(command, &cli, &config).await?,
         Command::Slot { command } => handle_slot(command, &cli).await?,
+        Command::Skill { command } => handle_skill(command, &config, cli.json).await?,
         Command::Workspace { command } => match command {
             WorkspaceCommand::Status { repo } => {
                 let status = WorkspaceEngine::new(repo).status().await?;
@@ -166,69 +195,209 @@ async fn main() -> anyhow::Result<()> {
             println!("Models: {}", report.models.len());
         }
         Command::Dashboard => {
-            let client = client(&cli)?;
-            let pipelines = client.pipelines().await?;
-            let models = client.models().await?;
-            render_dashboard(&pipelines, &models)?;
+            let hub_client = client(&cli)?;
+            run_live_dashboard(hub_client).await?;
         }
     }
     Ok(())
 }
 
-fn render_dashboard(
-    pipelines: &[acp_protocol::PipelineRecord],
-    models: &[acp_protocol::ModelRecord],
-) -> anyhow::Result<()> {
-    use ratatui::{
-        backend::CrosstermBackend,
-        layout::{Constraint, Direction, Layout},
-        style::{Color, Style},
-        text::Line,
-        widgets::{Block, Borders, List, ListItem, Paragraph},
-        Terminal,
-    };
-    use std::io;
+// ── Live dashboard ────────────────────────────────────────────────────────────
 
-    let backend = CrosstermBackend::new(io::stdout());
+#[derive(Default)]
+struct DashboardState {
+    pipelines: Vec<acp_protocol::PipelineRecord>,
+    models: Vec<acp_protocol::ModelRecord>,
+    events: Vec<String>,
+    quit: bool,
+}
+
+async fn run_live_dashboard(hub_client: AgentClient) -> anyhow::Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    terminal.draw(|frame| {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(8)])
-            .split(frame.area());
-        let summary = Paragraph::new(format!(
-            "models: {} | pipelines: {} | latest: {}",
-            models.len(),
-            pipelines.len(),
-            pipelines
-                .first()
-                .map(|pipeline| pipeline.status.to_string())
-                .unwrap_or_else(|| "none".to_string())
-        ))
-        .block(
-            Block::default()
-                .title("ACP Dashboard")
-                .borders(Borders::ALL),
-        );
-        frame.render_widget(summary, chunks[0]);
 
-        let rows = pipelines
-            .iter()
-            .take(12)
-            .map(|pipeline| {
-                ListItem::new(Line::from(format!(
-                    "{}  {}  {}",
-                    pipeline.id, pipeline.status, pipeline.profile
-                )))
-            })
-            .collect::<Vec<_>>();
-        let list = List::new(rows)
-            .block(Block::default().title("Pipelines").borders(Borders::ALL))
-            .style(Style::default().fg(Color::White));
-        frame.render_widget(list, chunks[1]);
-    })?;
+    let state = Arc::new(Mutex::new(DashboardState::default()));
+    let state_bg = state.clone();
+
+    // Background refresh task — fetches pipelines, models, and recent events every 3 s
+    let client_bg = hub_client.clone();
+    let refresh_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        loop {
+            interval.tick().await;
+            let pipelines = client_bg.pipelines().await.unwrap_or_default();
+            let models = client_bg.models().await.unwrap_or_default();
+            let events: Vec<String> = if let Some(p) = pipelines.first() {
+                client_bg
+                    .pipeline_events(p.id)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .rev()
+                    .take(10)
+                    .map(|e| {
+                        format!(
+                            "{} — {}",
+                            e.event_type,
+                            e.agent_id.as_deref().unwrap_or("-")
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut s = state_bg.lock().unwrap();
+            s.pipelines = pipelines;
+            s.models = models;
+            s.events = events;
+            if s.quit {
+                break;
+            }
+        }
+    });
+
+    loop {
+        {
+            let s = state.lock().unwrap();
+            if s.quit {
+                break;
+            }
+            let pipelines = s.pipelines.clone();
+            let models = s.models.clone();
+            let events = s.events.clone();
+            drop(s);
+            terminal.draw(|frame| draw_dashboard(frame, &pipelines, &models, &events))?;
+        }
+
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        state.lock().unwrap().quit = true;
+                        break;
+                    }
+                    KeyCode::Char('r') => {
+                        // Manual refresh
+                        if let Ok(pipelines) = hub_client.pipelines().await {
+                            state.lock().unwrap().pipelines = pipelines;
+                        }
+                        if let Ok(models) = hub_client.models().await {
+                            state.lock().unwrap().models = models;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    refresh_task.abort();
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
 }
+
+fn draw_dashboard(
+    frame: &mut ratatui::Frame,
+    pipelines: &[acp_protocol::PipelineRecord],
+    models: &[acp_protocol::ModelRecord],
+    events: &[String],
+) {
+    let area = frame.area();
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(5),
+        ])
+        .split(area);
+
+    // Header
+    let header = Paragraph::new(format!(
+        " ACP Dashboard  |  models: {}  |  pipelines: {}  |  [r] refresh  [q] quit",
+        models.len(),
+        pipelines.len(),
+    ))
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(header, vertical[0]);
+
+    // Middle: pipelines + models side by side
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(vertical[1]);
+
+    let pipeline_items: Vec<ListItem> = pipelines
+        .iter()
+        .take(20)
+        .map(|p| {
+            let color = match p.status {
+                PipelineStatus::Succeeded => Color::Green,
+                PipelineStatus::Failed => Color::Red,
+                PipelineStatus::Running => Color::Yellow,
+                _ => Color::White,
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:.8}  ", p.id),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("{:<12}", p.status.to_string()),
+                    Style::default().fg(color),
+                ),
+                Span::raw(p.profile.to_string()),
+            ]))
+        })
+        .collect();
+    let pipeline_list =
+        List::new(pipeline_items).block(Block::default().title("Pipelines").borders(Borders::ALL));
+    frame.render_widget(pipeline_list, horizontal[0]);
+
+    let model_items: Vec<ListItem> = models
+        .iter()
+        .take(20)
+        .map(|m| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<8}", m.tier.to_string()),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(format!("  {}", m.name)),
+            ]))
+        })
+        .collect();
+    let model_list =
+        List::new(model_items).block(Block::default().title("Models").borders(Borders::ALL));
+    frame.render_widget(model_list, horizontal[1]);
+
+    // Events log at the bottom
+    let recent: Vec<ListItem> = events
+        .iter()
+        .rev()
+        .take(3)
+        .map(|e| ListItem::new(Line::from(Span::raw(e.as_str()))))
+        .collect();
+    let log = List::new(recent)
+        .block(
+            Block::default()
+                .title("Recent events")
+                .borders(Borders::ALL),
+        )
+        .style(Style::default().fg(Color::Gray));
+    frame.render_widget(log, vertical[2]);
+}
+
+// ── Providers ─────────────────────────────────────────────────────────────────
 
 async fn handle_provider(
     command: ProviderCommand,
@@ -261,7 +430,48 @@ async fn handle_provider(
     Ok(())
 }
 
-async fn handle_pipeline(command: PipelineCommand, cli: &Cli) -> anyhow::Result<()> {
+// ── Skills ────────────────────────────────────────────────────────────────────
+
+async fn handle_skill(
+    command: SkillCommand,
+    config: &DiscoveryConfig,
+    json: bool,
+) -> anyhow::Result<()> {
+    let skills = load_skills(config)?;
+    match command {
+        SkillCommand::List => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&skills)?);
+            } else {
+                for skill in &skills {
+                    println!("{:<20} {}", skill.name, skill.description);
+                }
+                if skills.is_empty() {
+                    println!(
+                        "No skills found in {}",
+                        config.acp_home.join("skills").display()
+                    );
+                }
+            }
+        }
+        SkillCommand::Show { name } => {
+            let skill = skills
+                .iter()
+                .find(|s| s.name == name)
+                .with_context(|| format!("skill '{name}' not found"))?;
+            print_yaml(json, skill)?;
+        }
+    }
+    Ok(())
+}
+
+// ── Pipelines ─────────────────────────────────────────────────────────────────
+
+async fn handle_pipeline(
+    command: PipelineCommand,
+    cli: &Cli,
+    config: &DiscoveryConfig,
+) -> anyhow::Result<()> {
     let hub_client = client(cli)?;
     match command {
         PipelineCommand::Run {
@@ -307,7 +517,11 @@ async fn handle_pipeline(command: PipelineCommand, cli: &Cli) -> anyhow::Result<
                         },
                     )
                     .await?;
+
                 let models = hub_client.models().await?;
+                let capability_scores = hub_client.capability_scores().await.unwrap_or_default();
+                let skills = load_skills(config).unwrap_or_default();
+
                 let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
                 let event_client = client(cli)?;
                 let event_pipeline_id = pipeline.id;
@@ -317,9 +531,12 @@ async fn handle_pipeline(command: PipelineCommand, cli: &Cli) -> anyhow::Result<
                     }
                     anyhow::Ok(())
                 });
+
                 match run_local_pipeline_with_events(
                     &pipeline.workflow_yaml,
                     models,
+                    capability_scores,
+                    skills,
                     repo,
                     Some(event_tx),
                 )
@@ -340,19 +557,19 @@ async fn handle_pipeline(command: PipelineCommand, cli: &Cli) -> anyhow::Result<
                             println!(
                                 "{}",
                                 serde_json::to_string_pretty(&serde_json::json!({
-                                            "pipeline": pipeline,
-                                "report": {
-                                    "workflow_id": report.workflow_id,
-                                                "assignments": report.assignments.iter().map(|assignment| serde_json::json!({
-                                                    "role": assignment.role,
-                                                    "runtime_type": assignment.runtime_type,
-                                                    "model_id": assignment.model_id,
-                                                    "score": assignment.score,
-                                    })).collect::<Vec<_>>(),
-                                    "step_count": report.step_results.len(),
-                                    "slot_event_count": report.slot_events.len(),
-                                }
-                                        }))?
+                                    "pipeline": pipeline,
+                                    "report": {
+                                        "workflow_id": report.workflow_id,
+                                        "assignments": report.assignments.iter().map(|a| serde_json::json!({
+                                            "role": a.role,
+                                            "runtime_type": a.runtime_type,
+                                            "model_id": a.model_id,
+                                            "score": a.score,
+                                        })).collect::<Vec<_>>(),
+                                        "step_count": report.step_results.len(),
+                                        "slot_event_count": report.slot_events.len(),
+                                    }
+                                }))?
                             );
                         } else {
                             println!(
@@ -420,6 +637,8 @@ async fn handle_pipeline(command: PipelineCommand, cli: &Cli) -> anyhow::Result<
     Ok(())
 }
 
+// ── Slots ─────────────────────────────────────────────────────────────────────
+
 async fn handle_slot(command: SlotCommand, cli: &Cli) -> anyhow::Result<()> {
     let client = client(cli)?;
     match command {
@@ -471,6 +690,8 @@ async fn handle_slot(command: SlotCommand, cli: &Cli) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn client(cli: &Cli) -> anyhow::Result<AgentClient> {
     let token = cli
@@ -542,6 +763,8 @@ async fn persist_orchestrator_event(
                         payload: serde_json::json!({
                             "step": result.step,
                             "health": result.health,
+                            "runtime_type": result.runtime_type,
+                            "model_id": result.model_id,
                         }),
                         correlation_id: None,
                         causation_id: None,
@@ -573,6 +796,29 @@ async fn persist_orchestrator_event(
                         summary: context.summary,
                         key_decisions: serde_json::json!(context.key_decisions),
                         active_files: context.active_files,
+                    },
+                )
+                .await?;
+        }
+        OrchestratorEvent::MergeConflict {
+            role,
+            branch,
+            details,
+        } => {
+            client
+                .create_pipeline_event(
+                    pipeline_id,
+                    &PipelineEventCreateRequest {
+                        pipeline_id,
+                        agent_id: Some(role.clone()),
+                        event_type: "merge_conflict".to_string(),
+                        payload: serde_json::json!({
+                            "role": role,
+                            "branch": branch,
+                            "details": details,
+                        }),
+                        correlation_id: None,
+                        causation_id: None,
                     },
                 )
                 .await?;

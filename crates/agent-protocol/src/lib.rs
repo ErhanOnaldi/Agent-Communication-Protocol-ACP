@@ -767,6 +767,16 @@ pub struct FindingRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillDefinition {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub system_prompt: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
 }

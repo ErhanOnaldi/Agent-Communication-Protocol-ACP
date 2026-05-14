@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use tokio::process::Command;
+use tracing::instrument;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -62,6 +63,7 @@ impl WorkspaceEngine {
         }
     }
 
+    #[instrument(skip(self), fields(role = %role))]
     pub async fn create_agent_workspace(
         &self,
         role: &str,
@@ -118,6 +120,7 @@ impl WorkspaceEngine {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(branch = %branch))]
     pub async fn simulate_merge(&self, branch: &str) -> anyhow::Result<MergeSimulation> {
         let output = Command::new("git")
             .current_dir(&self.repo_root)
@@ -129,14 +132,14 @@ impl WorkspaceEngine {
             .await
             .context("failed to run git merge simulation")?;
         let clean = output.status.success();
-        if clean {
-            let _ = Command::new("git")
-                .current_dir(&self.repo_root)
-                .arg("merge")
-                .arg("--abort")
-                .output()
-                .await;
-        }
+        // Always abort: on success this resets the fast-forward; on conflict it
+        // clears the in-progress merge so the worktree is never left poisoned.
+        let _ = Command::new("git")
+            .current_dir(&self.repo_root)
+            .arg("merge")
+            .arg("--abort")
+            .output()
+            .await;
         Ok(MergeSimulation {
             clean,
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -144,6 +147,7 @@ impl WorkspaceEngine {
         })
     }
 
+    #[instrument(skip(self, config))]
     pub async fn validate(&self, config: ValidationConfig) -> anyhow::Result<ValidationReport> {
         let mut steps = Vec::new();
         for command in config.commands {

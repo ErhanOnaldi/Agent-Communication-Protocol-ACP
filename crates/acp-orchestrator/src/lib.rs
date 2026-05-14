@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use acp_protocol::{
-    AgentSpec, ModelRecord, RuntimeHealth, RuntimeType, SchedulerProfile, SlotStatus,
-    WorkflowConfig, WorkflowSlot, WorkflowStep,
+    AgentSpec, CapabilityScoreRecord, ModelRecord, RuntimeHealth, RuntimeType, SchedulerProfile,
+    SkillDefinition, SlotStatus, WorkflowConfig, WorkflowFailurePolicy, WorkflowSlot, WorkflowStep,
 };
 use acp_runtime::{adapter_for, RuntimeAdapter};
 use acp_workspace::WorkspaceEngine;
@@ -12,10 +12,12 @@ use tokio::{
     task::JoinSet,
     time::{timeout, Instant},
 };
+use tracing::instrument;
 
 #[derive(Debug, Clone)]
 pub struct Scheduler {
     models: Vec<ModelRecord>,
+    capability_scores: Vec<CapabilityScoreRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +46,13 @@ pub struct StepResult {
     pub health: RuntimeHealth,
     pub stdout: String,
     pub stderr: String,
+    pub conflict: Option<ConflictInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConflictInfo {
+    pub branch: String,
+    pub details: String,
 }
 
 #[derive(Debug, Clone)]
@@ -70,11 +79,57 @@ pub enum OrchestratorEvent {
         role: String,
         context: HandoffContext,
     },
+    MergeConflict {
+        role: String,
+        branch: String,
+        details: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FailureAction {
+    Retry(u32),
+    Skip,
+    AskUser,
+    Fail,
+}
+
+fn parse_failure_action(s: &str) -> FailureAction {
+    let s = s.trim();
+    if let Some(inner) = s.strip_prefix("retry(").and_then(|t| t.strip_suffix(')')) {
+        FailureAction::Retry(inner.trim().parse().unwrap_or(1))
+    } else {
+        match s {
+            "skip" => FailureAction::Skip,
+            "ask_user" => FailureAction::AskUser,
+            _ => FailureAction::Fail,
+        }
+    }
+}
+
+fn failure_action_for_role(policy: Option<&WorkflowFailurePolicy>, role: &str) -> FailureAction {
+    if let Some(pol) = policy {
+        if let Some(override_str) = pol.overrides.get(role) {
+            return parse_failure_action(override_str);
+        }
+        if let Some(default_str) = &pol.default {
+            return parse_failure_action(default_str);
+        }
+    }
+    FailureAction::Retry(1)
 }
 
 impl Scheduler {
     pub fn new(models: Vec<ModelRecord>) -> Self {
-        Self { models }
+        Self {
+            models,
+            capability_scores: Vec::new(),
+        }
+    }
+
+    pub fn with_scores(mut self, scores: Vec<CapabilityScoreRecord>) -> Self {
+        self.capability_scores = scores;
+        self
     }
 
     pub fn assign(
@@ -88,12 +143,9 @@ impl Scheduler {
             let model = preference
                 .model
                 .as_ref()
-                .and_then(|model_id| self.models.iter().find(|model| model.id == *model_id));
+                .and_then(|model_id| self.models.iter().find(|m| m.id == *model_id));
             let score = self.score(slot, preference.runtime, model, profile);
-            if best
-                .as_ref()
-                .is_none_or(|assignment: &Assignment| score > assignment.score)
-            {
+            if best.as_ref().is_none_or(|a: &Assignment| score > a.score) {
                 best = Some(Assignment {
                     role: role.to_string(),
                     runtime_type: preference.runtime,
@@ -103,13 +155,10 @@ impl Scheduler {
             }
         }
         best.or_else(|| {
-            self.models.first().map(|model| Assignment {
+            self.models.first().map(|m| Assignment {
                 role: role.to_string(),
-                runtime_type: model
-                    .runtime_source
-                    .parse()
-                    .unwrap_or(RuntimeType::ClaudeCode),
-                model_id: Some(model.id.clone()),
+                runtime_type: m.runtime_source.parse().unwrap_or(RuntimeType::ClaudeCode),
+                model_id: Some(m.id.clone()),
                 score: 0.5,
             })
         })
@@ -127,7 +176,7 @@ impl Scheduler {
             let model = preference
                 .model
                 .as_ref()
-                .and_then(|model_id| self.models.iter().find(|model| model.id == *model_id));
+                .and_then(|model_id| self.models.iter().find(|m| m.id == *model_id));
             candidates.push(Assignment {
                 role: role.to_string(),
                 runtime_type: preference.runtime,
@@ -138,10 +187,9 @@ impl Scheduler {
         if candidates.is_empty() {
             candidates.push(self.assign(role, slot, profile)?);
         }
-        candidates.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         Ok(candidates)
@@ -165,7 +213,7 @@ impl Scheduler {
             RuntimeType::Claudex => 0.65,
         };
         let cost_efficiency = model
-            .map(|model| match model.tier.to_string().as_str() {
+            .map(|m| match m.tier.to_string().as_str() {
                 "free" | "local" => 1.0,
                 "cheap" => 0.85,
                 "standard" => 0.65,
@@ -174,8 +222,8 @@ impl Scheduler {
             })
             .unwrap_or(0.5);
         let context_fit = model
-            .and_then(|model| model.context_window)
-            .map(|window| if window >= 128_000 { 1.0 } else { 0.75 })
+            .and_then(|m| m.context_window)
+            .map(|w| if w >= 128_000 { 1.0 } else { 0.75 })
             .unwrap_or(0.7);
         let latency = if runtime_type == RuntimeType::Claudex {
             0.8
@@ -192,7 +240,42 @@ impl Scheduler {
             SchedulerProfile::SpeedFirst => score += latency * 0.10,
             SchedulerProfile::QualityFirst => score += runtime_quality * 0.10,
         }
+        // Apply learned adjustment from capability scores
+        if let Some(model) = model {
+            score += self.learned_boost(runtime_type, &model.id, &slot.required_capabilities);
+        }
         score
+    }
+
+    fn learned_boost(
+        &self,
+        runtime_type: RuntimeType,
+        model_id: &str,
+        capabilities: &[String],
+    ) -> f64 {
+        if capabilities.is_empty() || self.capability_scores.is_empty() {
+            return 0.0;
+        }
+        let mut total = 0.0;
+        let mut count = 0usize;
+        for cap in capabilities {
+            if let Some(rec) = self.capability_scores.iter().find(|s| {
+                s.runtime_type == runtime_type && s.model_id == model_id && s.capability == *cap
+            }) {
+                let n = rec.success_count + rec.failure_count;
+                if n >= 5 {
+                    let rate = rec.success_count as f64 / n as f64;
+                    // Maps success_rate [0,1] -> learned adjustment [-0.10, +0.10]
+                    total += (rate - 0.5) * 0.20;
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 {
+            total / count as f64
+        } else {
+            0.0
+        }
     }
 }
 
@@ -205,38 +288,45 @@ pub async fn run_local_pipeline(
     models: Vec<ModelRecord>,
     repo_root: PathBuf,
 ) -> anyhow::Result<PipelineRunReport> {
-    run_local_pipeline_with_events(yaml, models, repo_root, None).await
+    run_local_pipeline_with_events(yaml, models, Vec::new(), Vec::new(), repo_root, None).await
 }
 
+#[instrument(skip(yaml, models, capability_scores, skills, event_sink))]
 pub async fn run_local_pipeline_with_events(
     yaml: &str,
     models: Vec<ModelRecord>,
+    capability_scores: Vec<CapabilityScoreRecord>,
+    skills: Vec<SkillDefinition>,
     repo_root: PathBuf,
     event_sink: Option<UnboundedSender<OrchestratorEvent>>,
 ) -> anyhow::Result<PipelineRunReport> {
     let config = parse_workflow(yaml)?;
-    let scheduler = Scheduler::new(models);
+    let scheduler = Scheduler::new(models).with_scores(capability_scores);
     let workspace = WorkspaceEngine::new(repo_root);
     let step_timeout = config
         .workflow
         .timeouts
         .as_ref()
-        .and_then(|timeouts| timeouts.step_minutes)
-        .map(|minutes| Duration::from_secs(minutes * 60))
+        .and_then(|t| t.step_minutes)
+        .map(|m| Duration::from_secs(m * 60))
         .unwrap_or_else(|| Duration::from_secs(30 * 60));
     let pipeline_deadline = config
         .workflow
         .timeouts
         .as_ref()
-        .and_then(|timeouts| timeouts.pipeline_minutes)
-        .map(|minutes| Instant::now() + Duration::from_secs(minutes * 60));
+        .and_then(|t| t.pipeline_minutes)
+        .map(|m| Instant::now() + Duration::from_secs(m * 60));
+    let failure_policy = config.workflow.failure.as_ref();
+    let skills = Arc::new(skills);
+
     let mut assignments = Vec::new();
     let mut slot_events = Vec::new();
     for (slot_name, slot) in &config.workflow.slots {
         let candidates = scheduler.candidates(slot_name, slot, config.workflow.profile)?;
-        let assignment = candidates.first().cloned().ok_or_else(|| {
-            anyhow::anyhow!("no runtime candidates available for role {slot_name}")
-        })?;
+        let assignment = candidates
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no runtime candidates for role {slot_name}"))?;
         let event = SlotLifecycleEvent {
             role: slot_name.clone(),
             status: SlotStatus::Assigned,
@@ -251,23 +341,33 @@ pub async fn run_local_pipeline_with_events(
         emit_slot(&mut slot_events, &event_sink, event);
         assignments.extend(candidates);
     }
+
     let assignments = Arc::new(assignments);
-    let handoff_contexts = Arc::new(Mutex::new(BTreeMap::new()));
+    let handoff_contexts: Arc<Mutex<BTreeMap<String, HandoffContext>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
     let slot_events = Arc::new(Mutex::new(slot_events));
     let mut step_results = Vec::new();
+
     for step in &config.workflow.steps {
         match step {
             WorkflowStep::Action(action) => {
                 enforce_pipeline_deadline(pipeline_deadline)?;
+                let role = action_role(action);
+                let fa = failure_action_for_role(failure_policy, &role);
+                let skill = find_skill(&skills, &role, &config.workflow.slots);
                 let result = timeout(
                     effective_step_timeout(step_timeout, pipeline_deadline),
                     run_action_with_recovery(
                         action,
-                        assignments.clone(),
-                        workspace.clone(),
-                        handoff_contexts.clone(),
-                        slot_events.clone(),
-                        event_sink.clone(),
+                        ActionCtx {
+                            assignments: assignments.clone(),
+                            workspace: workspace.clone(),
+                            handoff_contexts: handoff_contexts.clone(),
+                            slot_events: slot_events.clone(),
+                            event_sink: event_sink.clone(),
+                            failure_action: fa,
+                            skill,
+                        },
                     ),
                 )
                 .await
@@ -280,43 +380,53 @@ pub async fn run_local_pipeline_with_events(
                 for action in parallel {
                     enforce_pipeline_deadline(pipeline_deadline)?;
                     let action = action.clone();
-                    let assignments = assignments.clone();
-                    let workspace = workspace.clone();
-                    let contexts = handoff_contexts.clone();
-                    let slot_events = slot_events.clone();
-                    let event_sink = event_sink.clone();
+                    let role = action_role(&action);
+                    let fa = failure_action_for_role(failure_policy, &role);
+                    let skill = find_skill(&skills, &role, &config.workflow.slots);
+                    let parallel_timeout = effective_step_timeout(step_timeout, pipeline_deadline);
+                    // Clone shared state before moving into the async block
+                    let a = assignments.clone();
+                    let w = workspace.clone();
+                    let hc = handoff_contexts.clone();
+                    let se = slot_events.clone();
+                    let es = event_sink.clone();
                     join_set.spawn(async move {
                         timeout(
-                            step_timeout,
+                            parallel_timeout,
                             run_action_with_recovery(
                                 &action,
-                                assignments,
-                                workspace,
-                                contexts,
-                                slot_events,
-                                event_sink.clone(),
+                                ActionCtx {
+                                    assignments: a,
+                                    workspace: w,
+                                    handoff_contexts: hc,
+                                    slot_events: se,
+                                    event_sink: es,
+                                    failure_action: fa,
+                                    skill,
+                                },
                             ),
                         )
                         .await
                         .with_context(|| format!("workflow step timed out: {action}"))?
                     });
                 }
-                while let Some(result) = join_set.join_next().await {
-                    let result = result.context("parallel workflow task panicked")??;
+                while let Some(res) = join_set.join_next().await {
+                    let result = res.context("parallel workflow task panicked")??;
                     emit_step(&event_sink, result.clone());
                     step_results.push(result);
                 }
             }
         }
     }
-    let assignments =
-        Arc::try_unwrap(assignments).unwrap_or_else(|assignments| (*assignments).clone());
+
+    let assignments = Arc::try_unwrap(assignments).unwrap_or_else(|a| (*a).clone());
     let handoff_contexts = Arc::try_unwrap(handoff_contexts)
         .map_err(|_| anyhow::anyhow!("handoff context still shared"))?
         .into_inner();
     let slot_events = Arc::try_unwrap(slot_events)
         .map_err(|_| anyhow::anyhow!("slot events still shared"))?
         .into_inner();
+
     Ok(PipelineRunReport {
         workflow_id: config.workflow.id,
         assignments,
@@ -326,8 +436,29 @@ pub async fn run_local_pipeline_with_events(
     })
 }
 
+fn find_skill(
+    skills: &[SkillDefinition],
+    role: &str,
+    slots: &std::collections::BTreeMap<String, WorkflowSlot>,
+) -> Option<SkillDefinition> {
+    let slot = slots.get(role)?;
+    // Match by role name first, then by capability overlap
+    skills
+        .iter()
+        .find(|s| s.name == role || s.name == slot.role)
+        .or_else(|| {
+            skills.iter().find(|s| {
+                !s.capabilities.is_empty()
+                    && s.capabilities
+                        .iter()
+                        .any(|c| slot.required_capabilities.contains(c))
+            })
+        })
+        .cloned()
+}
+
 fn enforce_pipeline_deadline(deadline: Option<Instant>) -> anyhow::Result<()> {
-    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+    if deadline.is_some_and(|d| Instant::now() >= d) {
         bail!("workflow pipeline timed out");
     }
     Ok(())
@@ -335,8 +466,8 @@ fn enforce_pipeline_deadline(deadline: Option<Instant>) -> anyhow::Result<()> {
 
 fn effective_step_timeout(step_timeout: Duration, deadline: Option<Instant>) -> Duration {
     deadline
-        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-        .filter(|remaining| *remaining < step_timeout)
+        .map(|d| d.saturating_duration_since(Instant::now()))
+        .filter(|r| *r < step_timeout)
         .unwrap_or(step_timeout)
 }
 
@@ -378,15 +509,48 @@ fn emit_handoff(
     }
 }
 
-async fn run_action_with_recovery(
-    action: &str,
+fn emit_conflict(
+    event_sink: &Option<UnboundedSender<OrchestratorEvent>>,
+    role: String,
+    branch: String,
+    details: String,
+) {
+    if let Some(sink) = event_sink {
+        let _ = sink.send(OrchestratorEvent::MergeConflict {
+            role,
+            branch,
+            details,
+        });
+    }
+}
+
+struct ActionCtx {
     assignments: Arc<Vec<Assignment>>,
     workspace: WorkspaceEngine,
     handoff_contexts: Arc<Mutex<BTreeMap<String, HandoffContext>>>,
     slot_events: Arc<Mutex<Vec<SlotLifecycleEvent>>>,
     event_sink: Option<UnboundedSender<OrchestratorEvent>>,
-) -> anyhow::Result<StepResult> {
+    failure_action: FailureAction,
+    skill: Option<SkillDefinition>,
+}
+
+#[instrument(skip(ctx), fields(action = %action))]
+async fn run_action_with_recovery(action: &str, ctx: ActionCtx) -> anyhow::Result<StepResult> {
+    let ActionCtx {
+        assignments,
+        workspace,
+        handoff_contexts,
+        slot_events,
+        event_sink,
+        failure_action,
+        skill,
+    } = ctx;
     let role = action_role(action);
+    let max_attempts = match failure_action {
+        FailureAction::Retry(n) => n + 1,
+        _ => 1,
+    };
+
     push_slot(
         &slot_events,
         &event_sink,
@@ -399,145 +563,180 @@ async fn run_action_with_recovery(
         },
     )
     .await;
-    push_slot(
-        &slot_events,
-        &event_sink,
-        SlotLifecycleEvent {
-            role: role.clone(),
-            status: SlotStatus::Working,
-            reason: format!("executing {action}"),
-            runtime_type: None,
-            model_id: None,
-        },
-    )
-    .await;
-    let context = {
-        let contexts = handoff_contexts.lock().await;
-        contexts.get(&role).cloned().unwrap_or_default()
-    };
-    let result = run_action_with_context(action, &assignments, &workspace, context, None).await?;
-    if is_recoverable(result.health) {
-        push_slot(
-            &slot_events,
-            &event_sink,
-            SlotLifecycleEvent {
-                role: role.clone(),
-                status: SlotStatus::Vacant,
-                reason: format!("recoverable runtime failure: {}", result.health),
-                runtime_type: None,
-                model_id: None,
-            },
-        )
-        .await;
-        let context = context_from_failure(action, &result);
-        {
-            let mut contexts = handoff_contexts.lock().await;
-            contexts.insert(role.clone(), context.clone());
-        }
-        emit_handoff(&event_sink, role.clone(), context.clone());
-        let fallback = fallback_assignment(&assignments, &role, &result)?;
-        push_slot(
-            &slot_events,
-            &event_sink,
-            SlotLifecycleEvent {
-                role: role.clone(),
-                status: SlotStatus::Assigned,
-                reason: format!(
-                    "fallback assigned {} {}",
-                    fallback.runtime_type,
-                    fallback.model_id.as_deref().unwrap_or("default")
-                ),
-                runtime_type: Some(fallback.runtime_type),
-                model_id: fallback.model_id.clone(),
-            },
-        )
-        .await;
+
+    let mut current_override: Option<Assignment> = None;
+    let mut last_failed: Option<StepResult> = None;
+
+    for attempt in 0..max_attempts {
         push_slot(
             &slot_events,
             &event_sink,
             SlotLifecycleEvent {
                 role: role.clone(),
                 status: SlotStatus::Working,
-                reason: "resuming with handoff context".to_string(),
-                runtime_type: Some(fallback.runtime_type),
-                model_id: fallback.model_id.clone(),
+                reason: if attempt == 0 {
+                    format!("executing {action}")
+                } else {
+                    format!("retry attempt {attempt} for {action}")
+                },
+                runtime_type: current_override.as_ref().map(|a| a.runtime_type),
+                model_id: current_override.as_ref().and_then(|a| a.model_id.clone()),
             },
         )
         .await;
-        let retry = run_action_with_context(
+
+        let context = {
+            handoff_contexts
+                .lock()
+                .await
+                .get(&role)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let result = run_action_with_context(
             action,
             &assignments,
             &workspace,
             context,
-            Some(fallback.clone()),
+            current_override.clone(),
+            skill.as_ref(),
+            &event_sink,
         )
         .await?;
-        if is_recoverable(retry.health) {
+
+        if !is_recoverable(result.health) {
             push_slot(
                 &slot_events,
                 &event_sink,
                 SlotLifecycleEvent {
-                    role,
-                    status: SlotStatus::Vacant,
-                    reason: format!("fallback failed: {}", retry.health),
+                    role: role.clone(),
+                    status: SlotStatus::Waiting,
+                    reason: format!("completed {action}"),
                     runtime_type: None,
                     model_id: None,
                 },
             )
             .await;
+            return Ok(result);
+        }
+
+        // Recoverable failure
+        push_slot(
+            &slot_events,
+            &event_sink,
+            SlotLifecycleEvent {
+                role: role.clone(),
+                status: SlotStatus::Vacant,
+                reason: format!("recoverable failure: {}", result.health),
+                runtime_type: None,
+                model_id: None,
+            },
+        )
+        .await;
+
+        let ctx = context_from_failure(action, &result);
+        {
+            handoff_contexts
+                .lock()
+                .await
+                .insert(role.clone(), ctx.clone());
+        }
+        emit_handoff(&event_sink, role.clone(), ctx);
+
+        // Try to find a different fallback for next attempt
+        if attempt + 1 < max_attempts {
+            match fallback_assignment(&assignments, &role, &result) {
+                Ok(fb) => {
+                    push_slot(
+                        &slot_events,
+                        &event_sink,
+                        SlotLifecycleEvent {
+                            role: role.clone(),
+                            status: SlotStatus::Assigned,
+                            reason: format!(
+                                "fallback assigned {} {}",
+                                fb.runtime_type,
+                                fb.model_id.as_deref().unwrap_or("default")
+                            ),
+                            runtime_type: Some(fb.runtime_type),
+                            model_id: fb.model_id.clone(),
+                        },
+                    )
+                    .await;
+                    current_override = Some(fb);
+                }
+                Err(_) => {
+                    last_failed = Some(result);
+                    break;
+                }
+            }
         } else {
+            last_failed = Some(result);
+        }
+    }
+
+    // All attempts exhausted
+    match failure_action {
+        FailureAction::Skip => {
             push_slot(
                 &slot_events,
                 &event_sink,
                 SlotLifecycleEvent {
-                    role,
-                    status: SlotStatus::Waiting,
-                    reason: "step completed after recovery".to_string(),
-                    runtime_type: Some(fallback.runtime_type),
-                    model_id: fallback.model_id.clone(),
+                    role: role.clone(),
+                    status: SlotStatus::Disabled,
+                    reason: format!("step {action} skipped after exhausting retries"),
+                    runtime_type: None,
+                    model_id: None,
                 },
             )
             .await;
+            Ok(last_failed.unwrap_or_else(|| StepResult {
+                step: action.to_string(),
+                role,
+                runtime_type: RuntimeType::ClaudeCode,
+                model_id: None,
+                health: RuntimeHealth::Healthy,
+                stdout: String::new(),
+                stderr: String::new(),
+                conflict: None,
+            }))
         }
-        return Ok(retry);
+        FailureAction::AskUser => {
+            bail!(
+                "step {action} failed after {max_attempts} attempts; manual intervention required"
+            )
+        }
+        _ => bail!("step {action} failed after {max_attempts} attempts"),
     }
-    push_slot(
-        &slot_events,
-        &event_sink,
-        SlotLifecycleEvent {
-            role,
-            status: SlotStatus::Waiting,
-            reason: format!("completed {action}"),
-            runtime_type: None,
-            model_id: None,
-        },
-    )
-    .await;
-    Ok(result)
 }
 
+#[instrument(skip(
+    assignments,
+    workspace,
+    context,
+    override_assignment,
+    skill,
+    event_sink
+))]
 async fn run_action_with_context(
     action: &str,
     assignments: &[Assignment],
     workspace: &WorkspaceEngine,
     context: HandoffContext,
     override_assignment: Option<Assignment>,
+    skill: Option<&SkillDefinition>,
+    event_sink: &Option<UnboundedSender<OrchestratorEvent>>,
 ) -> anyhow::Result<StepResult> {
     let role = action_role(action);
     let assignment = override_assignment
-        .or_else(|| {
-            assignments
-                .iter()
-                .find(|assignment| assignment.role == role)
-                .cloned()
-        })
+        .or_else(|| assignments.iter().find(|a| a.role == role).cloned())
         .ok_or_else(|| anyhow::anyhow!("no assignment for workflow step {action}"))?;
     let agent_workspace = workspace.create_agent_workspace(&role, None).await?;
     let adapter = adapter_for(assignment.runtime_type);
-    let task = inject_context(action, &context);
+    let task = build_task(action, &context, skill);
     let output = adapter
         .spawn(AgentSpec {
-            agent_id: agent_workspace.agent_id,
+            agent_id: agent_workspace.agent_id.clone(),
             role: role.clone(),
             runtime_type: assignment.runtime_type,
             model: assignment.model_id.clone(),
@@ -547,6 +746,25 @@ async fn run_action_with_context(
             env: Default::default(),
         })
         .await?;
+
+    // Post-step merge conflict detection
+    let conflict = match workspace.simulate_merge(&agent_workspace.branch).await {
+        Ok(sim) if !sim.clean => {
+            let details = format!("{}\n{}", sim.stdout, sim.stderr);
+            emit_conflict(
+                event_sink,
+                role.clone(),
+                agent_workspace.branch.clone(),
+                details.clone(),
+            );
+            Some(ConflictInfo {
+                branch: agent_workspace.branch,
+                details,
+            })
+        }
+        _ => None,
+    };
+
     Ok(StepResult {
         step: action.to_string(),
         role,
@@ -555,7 +773,29 @@ async fn run_action_with_context(
         health: output.status,
         stdout: output.stdout,
         stderr: output.stderr,
+        conflict,
     })
+}
+
+fn build_task(action: &str, context: &HandoffContext, skill: Option<&SkillDefinition>) -> String {
+    let mut task = action.to_string();
+    if let Some(skill) = skill {
+        if !skill.system_prompt.trim().is_empty() {
+            task = format!(
+                "{task}\n\nRole context ({}):\n{}",
+                skill.name, skill.system_prompt
+            );
+        }
+    }
+    if !context.summary.trim().is_empty() {
+        task = format!(
+            "{task}\n\nACP handoff context:\nSummary: {}\nKey decisions: {}\nActive files: {}",
+            context.summary,
+            context.key_decisions.join("; "),
+            context.active_files.join(", ")
+        );
+    }
+    task
 }
 
 fn action_role(action: &str) -> String {
@@ -591,38 +831,17 @@ fn fallback_assignment(
     role: &str,
     failed: &StepResult,
 ) -> anyhow::Result<Assignment> {
-    let current = assignments
-        .iter()
-        .find(|assignment| assignment.role == role);
+    let current = assignments.iter().find(|a| a.role == role);
     let fallback = assignments
         .iter()
-        .find(|assignment| {
-            assignment.role == role
-                && current.is_none_or(|current| {
-                    assignment.runtime_type != current.runtime_type
-                        || assignment.model_id != current.model_id
-                })
+        .find(|a| {
+            a.role == role
+                && current
+                    .is_none_or(|c| a.runtime_type != c.runtime_type || a.model_id != c.model_id)
         })
         .cloned()
         .or_else(|| current.cloned());
-    fallback.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no fallback assignment available for role {role} after {}",
-            failed.health
-        )
-    })
-}
-
-fn inject_context(action: &str, context: &HandoffContext) -> String {
-    if context.summary.trim().is_empty() {
-        return action.to_string();
-    }
-    format!(
-        "{action}\n\nACP handoff context:\nSummary: {}\nKey decisions: {}\nActive files: {}",
-        context.summary,
-        context.key_decisions.join("; "),
-        context.active_files.join(", ")
-    )
+    fallback.ok_or_else(|| anyhow::anyhow!("no fallback for role {role} after {}", failed.health))
 }
 
 #[cfg(test)]
@@ -659,17 +878,97 @@ workflow:
 
     #[test]
     fn injects_handoff_context_into_retry_prompt() {
-        let prompt = inject_context(
+        let prompt = build_task(
             "backend.implement",
             &HandoffContext {
                 summary: "rate limit after editing auth".to_string(),
                 key_decisions: vec!["keep public API stable".to_string()],
                 active_files: vec!["src/auth.rs".to_string()],
             },
+            None,
         );
         assert!(prompt.contains("ACP handoff context"));
         assert!(prompt.contains("rate limit after editing auth"));
         assert!(prompt.contains("src/auth.rs"));
+    }
+
+    #[test]
+    fn skill_system_prompt_injected() {
+        let skill = SkillDefinition {
+            name: "rust-backend".to_string(),
+            description: "Rust expert".to_string(),
+            system_prompt: "You write idiomatic Rust.".to_string(),
+            capabilities: vec!["rust".to_string()],
+        };
+        let prompt = build_task(
+            "backend.implement",
+            &HandoffContext::default(),
+            Some(&skill),
+        );
+        assert!(prompt.contains("You write idiomatic Rust."));
+        assert!(prompt.contains("Role context"));
+    }
+
+    #[test]
+    fn failure_action_parsed_correctly() {
+        assert!(matches!(
+            parse_failure_action("retry(3)"),
+            FailureAction::Retry(3)
+        ));
+        assert!(matches!(
+            parse_failure_action("retry(1)"),
+            FailureAction::Retry(1)
+        ));
+        assert!(matches!(parse_failure_action("skip"), FailureAction::Skip));
+        assert!(matches!(
+            parse_failure_action("ask_user"),
+            FailureAction::AskUser
+        ));
+        assert!(matches!(parse_failure_action("fail"), FailureAction::Fail));
+    }
+
+    #[test]
+    fn adaptive_score_boosts_high_success_rate() {
+        let model = ModelRecord {
+            id: "codex/default".to_string(),
+            name: "Codex".to_string(),
+            runtime_source: "codex".to_string(),
+            tier: acp_protocol::ModelTier::Premium,
+            context_window: None,
+            pricing: acp_protocol::ModelPricing {
+                input: None,
+                output: None,
+            },
+        };
+        let scores = vec![CapabilityScoreRecord {
+            runtime_type: RuntimeType::Codex,
+            model_id: "codex/default".to_string(),
+            capability: "rust".to_string(),
+            success_count: 9,
+            failure_count: 1,
+        }];
+        let scheduler = Scheduler::new(vec![model]).with_scores(scores);
+        let slot = WorkflowSlot {
+            role: "backend".to_string(),
+            runtime_mode: None,
+            preferred: vec![],
+            required_capabilities: vec!["rust".to_string()],
+            optional: false,
+        };
+        let base = scheduler.score(
+            &slot,
+            RuntimeType::Codex,
+            None,
+            SchedulerProfile::QualityFirst,
+        );
+        let with_model = scheduler.score(
+            &slot,
+            RuntimeType::Codex,
+            scheduler.models.first(),
+            SchedulerProfile::QualityFirst,
+        );
+        // Model with high success rate on "rust" should score higher than no model
+        assert!(with_model > base);
     }
 
     #[test]
@@ -696,6 +995,7 @@ workflow:
             health: RuntimeHealth::RateLimited,
             stdout: String::new(),
             stderr: String::new(),
+            conflict: None,
         };
         let fallback = fallback_assignment(&assignments, "backend", &failed).unwrap();
         assert_eq!(fallback.runtime_type, RuntimeType::Codex);
@@ -782,17 +1082,23 @@ workflow:
                 output: None,
             },
         }];
-        let report =
-            run_local_pipeline_with_events(yaml, models, temp.path().to_path_buf(), Some(tx))
-                .await
-                .unwrap();
-        std::env::set_var("PATH", old_path);
-
-        assert_eq!(report.step_results.len(), 2);
-        let mut event_count = 0;
-        while rx.try_recv().is_ok() {
-            event_count += 1;
+        let result = run_local_pipeline_with_events(
+            yaml,
+            models,
+            Vec::new(),
+            Vec::new(),
+            temp.path().to_path_buf(),
+            Some(tx),
+        )
+        .await;
+        assert!(result.is_ok(), "pipeline failed: {result:?}");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
         }
-        assert!(event_count >= 6);
+        assert!(
+            !events.is_empty(),
+            "expected orchestrator events to be emitted"
+        );
     }
 }

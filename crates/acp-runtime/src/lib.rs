@@ -4,6 +4,7 @@ use acp_protocol::{AgentSpec, RuntimeHealth, RuntimeOutput, RuntimeStreamEvent, 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use tokio::{process::Command, time::timeout};
+use tracing::instrument;
 
 #[async_trait]
 pub trait RuntimeAdapter: Send + Sync {
@@ -102,6 +103,7 @@ impl ProcessRuntimeAdapter {
 
 #[async_trait]
 impl RuntimeAdapter for ProcessRuntimeAdapter {
+    #[instrument(skip(self, spec), fields(runtime = %self.runtime_type, role = %spec.role))]
     async fn spawn(&self, spec: AgentSpec) -> anyhow::Result<RuntimeOutput> {
         let mut command = self.command_for(&spec)?;
         let output = timeout(self.timeout, command.output())
@@ -121,6 +123,7 @@ impl RuntimeAdapter for ProcessRuntimeAdapter {
         })
     }
 
+    #[instrument(skip(self), fields(binary = %self.binary))]
     async fn health(&self) -> RuntimeHealth {
         match Command::new(&self.binary).arg("--version").output().await {
             Ok(output) if output.status.success() => RuntimeHealth::Healthy,

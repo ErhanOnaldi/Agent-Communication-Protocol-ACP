@@ -58,6 +58,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -76,6 +77,7 @@ dependencies = [
  "async-trait",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -85,6 +87,7 @@ dependencies = [
  "anyhow",
  "tempfile",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
